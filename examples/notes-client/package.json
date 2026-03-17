@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@sync-subscribe/client": "workspace:*",
+    "@sync-subscribe/client-react": "workspace:*",
     "@sync-subscribe/core": "workspace:*",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

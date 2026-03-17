@@ -1,6 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { SyncClient } from "@sync-subscribe/client";
-import { createTransport } from "./transport.js";
+import { useMemo, useState } from "react";
+import { useRecords, useMutate } from "@sync-subscribe/client-react";
 import type { NoteRecord } from "./types.js";
 import NotesList from "./components/NotesList.js";
 import CreateNoteForm from "./components/CreateNoteForm.js";
@@ -9,9 +8,6 @@ type Tab = "all" | "recent" | "blue";
 
 const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
 
-// Module-level client — persists across React re-renders
-const client = new SyncClient<NoteRecord>(createTransport());
-
 const tabLabel: Record<Tab, string> = {
   all: "All Notes",
   recent: "Recent (30 days)",
@@ -19,107 +15,71 @@ const tabLabel: Record<Tab, string> = {
 };
 
 export default function App() {
-  const [notes, setNotes] = useState<NoteRecord[]>([]);
   const [tab, setTab] = useState<Tab>("all");
   const [showCreate, setShowCreate] = useState(false);
-  const [status, setStatus] = useState<"idle" | "syncing" | "error">("idle");
-  const initialized = useRef(false);
+  const mutate = useMutate<NoteRecord>();
 
-  const refreshNotes = useCallback(() => {
-    setNotes(client.store.getAll().filter((n) => !n.isDeleted));
-  }, []);
+  // Stable cutoff so the filter doesn't change identity on every render.
+  const thirtyDaysAgo = useMemo(() => Date.now() - THIRTY_DAYS, []);
 
-  useEffect(() => {
-    if (initialized.current) return;
-    initialized.current = true;
-
-    let cancelled = false;
-
-    async function init() {
-      setStatus("syncing");
-      try {
-        const thirtyDaysAgo = Date.now() - THIRTY_DAYS;
-        // Two simultaneous subscriptions — notes in both are stored once locally
-        await client.subscribe({ filter: { createdAt: { $gte: thirtyDaysAgo } } });
-        await client.subscribe({ filter: { color: "blue" } });
-        await client.pull();
-        if (!cancelled) refreshNotes();
-        setStatus("idle");
-      } catch {
-        if (!cancelled) setStatus("error");
-      }
-    }
-
-    init();
-
-    const unsub = client.onPatches(() => {
-      if (!cancelled) refreshNotes();
-    });
-
-    // Poll every 5 s so multiple browser tabs stay in sync
-    const timer = setInterval(async () => {
-      try {
-        await client.pull();
-      } catch {
-        // swallow — will retry next tick
-      }
-    }, 5000);
-
-    return () => {
-      cancelled = true;
-      unsub();
-      clearInterval(timer);
-    };
-  }, [refreshNotes]);
-
-  const visibleNotes = notes.filter((n) => {
-    if (tab === "recent") return n.createdAt >= Date.now() - THIRTY_DAYS;
-    if (tab === "blue") return n.color === "blue";
-    return true;
+  // Two server-side subscriptions, mirroring the original design.
+  // Both share the same LocalStore so overlapping records are stored once.
+  const recentNotes = useRecords<NoteRecord>({
+    filter: { createdAt: { $gte: thirtyDaysAgo } },
   });
+  const blueNotes = useRecords<NoteRecord>({
+    filter: { color: "blue" },
+  });
+
+  // Merge both views into one deduped list (by recordId), excluding deleted.
+  const allNotes = useMemo(() => {
+    const map = new Map<string, NoteRecord>();
+    for (const n of [...recentNotes, ...blueNotes]) {
+      if (!n.isDeleted) map.set(n.recordId, n);
+    }
+    return [...map.values()];
+  }, [recentNotes, blueNotes]);
+
+  const visibleNotes = useMemo(() => {
+    if (tab === "recent") return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo);
+    if (tab === "blue") return allNotes.filter((n) => n.color === "blue");
+    return allNotes;
+  }, [tab, allNotes, thirtyDaysAgo]);
 
   async function handleCreate(
     data: Omit<NoteRecord, "recordId" | "createdAt" | "updatedAt" | "revisionCount" | "userId">
   ) {
-    const note: NoteRecord = {
+    await mutate({
       recordId: crypto.randomUUID(),
       userId: "user-123",
       createdAt: Date.now(),
       updatedAt: Date.now(),
       revisionCount: 1,
       ...data,
-    };
-    await client.mutate(note);
-    refreshNotes();
+    });
     setShowCreate(false);
   }
 
   async function handleDelete(note: NoteRecord) {
-    await client.mutate({
+    await mutate({
       ...note,
       isDeleted: true,
       updatedAt: Date.now(),
       revisionCount: note.revisionCount + 1,
     });
-    refreshNotes();
   }
+
+  const countFor = (t: Tab) => {
+    if (t === "recent") return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo).length;
+    if (t === "blue") return allNotes.filter((n) => n.color === "blue").length;
+    return allNotes.length;
+  };
 
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 16px" }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, flex: 1 }}>Notes</h1>
-        <span
-          style={{
-            fontSize: 12,
-            color: status === "error" ? "#ef4444" : "#64748b",
-            background: "#f1f5f9",
-            padding: "4px 10px",
-            borderRadius: 9999,
-          }}
-        >
-          {status === "syncing" ? "Syncing…" : status === "error" ? "Sync error" : "Live"}
-        </span>
         <button
           onClick={() => setShowCreate(true)}
           style={{
@@ -166,11 +126,7 @@ export default function App() {
                 fontSize: 11,
               }}
             >
-              {tab === t ? visibleNotes.length : notes.filter((n) => {
-                if (t === "recent") return n.createdAt >= Date.now() - THIRTY_DAYS;
-                if (t === "blue") return n.color === "blue";
-                return true;
-              }).length}
+              {countFor(t)}
             </span>
           </button>
         ))}
