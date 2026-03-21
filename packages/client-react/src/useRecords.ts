@@ -3,8 +3,8 @@ import type { SyncRecord, SubscriptionFilter } from "@sync-subscribe/core";
 import { matchesFilter } from "@sync-subscribe/core";
 import { useSyncClient } from "./context.js";
 
-export interface UseRecordsOptions {
-  filter: SubscriptionFilter;
+export interface UseRecordsOptions<T extends SyncRecord = SyncRecord> {
+  filter: SubscriptionFilter<T>;
   /**
    * Stable name for this subscription. When provided, the subscription state
    * is persisted to the local store and automatically restored on next startup,
@@ -31,7 +31,7 @@ export interface UseRecordsOptions {
  * const notes = useRecords<NoteRecord>({ filter: { isDeleted: false } });
  */
 export function useRecords<T extends SyncRecord>(
-  options: UseRecordsOptions,
+  options: UseRecordsOptions<T>,
 ): T[] {
   const { filter, name } = options;
   const client = useSyncClient<T>();
@@ -51,7 +51,7 @@ export function useRecords<T extends SyncRecord>(
     const all = await client.store.getAll();
     const f = filterRef.current;
     setRecords(
-      all.filter((r) => matchesFilter(r as Record<string, unknown>, f)),
+      all.filter((r) => matchesFilter(r, f)),
     );
   }, [client]);
 

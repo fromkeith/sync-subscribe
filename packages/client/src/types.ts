@@ -79,7 +79,7 @@ export interface ILocalStore<T extends SyncRecord> {
    * then we should retain items defined by the other subs
    */
   evict(
-    evictFilter: SubscriptionFilter,
+    evictFilter: SubscriptionFilter<T>,
     retainOtherSubs: boolean,
   ): Promise<void>;
   /** Persist the latest sync token for an unnamed subscription across sessions. */
