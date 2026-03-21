@@ -1,17 +1,18 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { SyncClient } from "@sync-subscribe/client";
+import { SyncClient, IdbLocalStore } from "@sync-subscribe/client";
 import { SyncProvider } from "@sync-subscribe/client-react";
-import { createTransport } from "./transport.js";
+import { transport } from "./transport.js";
 import type { NoteRecord } from "./types.js";
 import App from "./App.js";
 
-const client = new SyncClient<NoteRecord>(createTransport());
+const localStore = new IdbLocalStore<NoteRecord>("notes");
+const client = new SyncClient<NoteRecord>(transport, localStore);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <SyncProvider client={client}>
       <App />
     </SyncProvider>
-  </StrictMode>
+  </StrictMode>,
 );

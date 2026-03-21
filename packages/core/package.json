@@ -22,5 +22,8 @@
     "@types/node": "^22.0.0",
     "typescript": "*",
     "vitest": "*"
+  },
+  "dependencies": {
+    "sift": "^17.1.3"
   }
 }

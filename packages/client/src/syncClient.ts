@@ -1,12 +1,19 @@
-import type { SyncRecord, SyncPatch } from "@sync-subscribe/core";
+import {
+  type SyncRecord,
+  type SyncPatch,
+  type SyncToken,
+  type SubscriptionFilter,
+  filtersEqual,
+} from "@sync-subscribe/core";
 import type {
   ClientSubscription,
   ClientSubscriptionOptions,
   ILocalStore,
   PatchListener,
+  PersistedSubscription,
   SyncTransport,
 } from "./types.js";
-import { LocalStore } from "./localStore.js";
+import { InMemoryStore } from "./inMemoryStore.js";
 
 /**
  * High-level client that manages subscriptions, local state, and sync cycles.
@@ -17,7 +24,6 @@ import { LocalStore } from "./localStore.js";
  * Omit `store` to use the default in-memory LocalStore.
  */
 export class SyncClient<T extends SyncRecord> {
-  private subscriptions = new Map<string, ClientSubscription>();
   private listeners: PatchListener<T>[] = [];
 
   readonly store: ILocalStore<T>;
@@ -26,20 +32,56 @@ export class SyncClient<T extends SyncRecord> {
     private readonly transport: SyncTransport,
     store?: ILocalStore<T>,
   ) {
-    this.store = store ?? new LocalStore<T>();
+    this.store = store ?? new InMemoryStore<T>();
   }
 
   // ---------------------------------------------------------------------------
   // Subscriptions
   // ---------------------------------------------------------------------------
 
-  async subscribe(options: ClientSubscriptionOptions): Promise<ClientSubscription> {
-    const sub = await this.transport.createSubscription(
-      options.filter,
-      options.previousSubscriptionId
-    );
-    this.subscriptions.set(sub.subscriptionId, sub);
-    return sub;
+  async subscribe(
+    options: ClientSubscriptionOptions,
+  ): Promise<ClientSubscription> {
+    const { name } = options;
+
+    // If named and no explicit previousSubscriptionId, try to restore from store.
+    let previousSubscriptionId = options.previousSubscriptionId;
+    let storedSub: PersistedSubscription | undefined;
+
+    if (name && previousSubscriptionId === undefined) {
+      storedSub = await this.store.getSubscription(name);
+      if (storedSub) {
+        previousSubscriptionId = storedSub.subscriptionId;
+      }
+    } else if (previousSubscriptionId !== undefined) {
+      storedSub = await this.store.getSubscriptionById(previousSubscriptionId);
+    }
+
+    // new sub, or one that needs to change
+    const filtersAreEqual = storedSub
+      ? filtersEqual(storedSub.filter, options.filter)
+      : false;
+    if (!storedSub || filtersAreEqual === false) {
+      const result = await this.transport.createSubscription(
+        options.filter,
+        previousSubscriptionId,
+      );
+      if (storedSub && storedSub.subscriptionId !== result.subscriptionId) {
+        throw new Error("SubscriptionId mismatch from server");
+      }
+      // save the updated subscription
+      await this.store.setSubscription(name ?? result.subscriptionId, {
+        subscriptionId: result.subscriptionId,
+        filter: result.filter,
+        syncToken: result.syncToken,
+      });
+      if (storedSub && result.resetRequired) {
+        // evit the old filter, but keep new filter
+        await this.store.evict(storedSub.filter, true);
+      }
+      storedSub = result;
+    }
+    return storedSub;
   }
 
   // ---------------------------------------------------------------------------
@@ -48,16 +90,17 @@ export class SyncClient<T extends SyncRecord> {
 
   /** Pull all pending patches for every active subscription. */
   async pull(): Promise<void> {
-    for (const sub of this.subscriptions.values()) {
+    const subscriptions = await this.store.listSubscriptions();
+    for (const sub of subscriptions) {
       const { patches, syncToken } = await this.transport.pull(
         sub.subscriptionId,
-        sub.syncToken
+        sub.syncToken,
       );
-
       // Cast is safe because T extends SyncRecord and we own both sides.
-      const applied = await this.store.applyPatches(patches as SyncPatch<T>[]);
-      sub.syncToken = syncToken;
-
+      const applied = await this.store.applyPatches(
+        patches as SyncPatch<T>[],
+        syncToken,
+      );
       if (applied.length > 0) {
         this.emit(applied);
       }
@@ -71,22 +114,26 @@ export class SyncClient<T extends SyncRecord> {
   async mutate(record: T): Promise<boolean> {
     await this.store.write(record);
 
-    const [sub] = this.subscriptions.values();
-    if (!sub) {
+    // TODO: figure out which subscriptions this affected
+    // then push that data... or just push that data..
+    // we shouldn't need a subscriptoin to push data
+
+    const subscriptions = await this.store.listSubscriptions();
+    if (!subscriptions) {
       // No active subscription yet; queue for later (not implemented here).
       return true;
     }
 
-    const result = await this.transport.push(sub.subscriptionId, [record]);
+    // const result = await this.transport.push(sub.subscriptionId, [record]);
 
-    if ("conflict" in result && result.conflict) {
-      // Server wins: overwrite local record with server version.
-      await this.store.applyPatches([
-        { op: "upsert", record: result.serverRecord as T },
-      ]);
-      this.emit([{ op: "upsert", record: result.serverRecord as T }]);
-      return false;
-    }
+    // if ("conflict" in result && result.conflict) {
+    //   // Server wins: overwrite local record with server version.
+    //   await this.store.applyPatches([
+    //     { op: "upsert", record: result.serverRecord as T },
+    //   ]);
+    //   this.emit([{ op: "upsert", record: result.serverRecord as T }]);
+    //   return false;
+    // }
 
     return true;
   }
@@ -110,13 +157,48 @@ export class SyncClient<T extends SyncRecord> {
   // Helpers
   // ---------------------------------------------------------------------------
 
-  getSubscription(id: string): ClientSubscription | undefined {
-    return this.subscriptions.get(id);
+  /**
+   * Open an SSE stream for a subscription. Patches are applied to the local
+   * store and patch listeners are notified automatically.
+   *
+   * Requires transport.stream to be implemented.
+   * Returns a cleanup function — call it to close the connection.
+   */
+  async stream(subscriptionId: string): Promise<() => void> {
+    if (!this.transport.stream) {
+      throw new Error(
+        "Transport does not support streaming — implement transport.stream()",
+      );
+    }
+    const sub = await this.store.getSubscriptionById(subscriptionId);
+    if (!sub) {
+      throw new Error(`Unknown subscription: ${subscriptionId}`);
+    }
+    return this.transport.stream(
+      subscriptionId,
+      sub.syncToken,
+      async ({ patches, syncToken }) => {
+        const applied = await this.store.applyPatches(
+          patches as SyncPatch<T>[],
+          syncToken,
+        );
+        if (applied.length > 0) this.emit(applied);
+      },
+      (err) => console.error("[SyncClient] SSE error:", err),
+    );
+  }
+
+  getSubscriptionById(id: string): Promise<ClientSubscription | undefined> {
+    return this.store.getSubscriptionById(id);
+  }
+
+  getSubscription(name: string): Promise<ClientSubscription | undefined> {
+    return this.store.getSubscription(name);
   }
 
   /** Resets sync state (useful for logout / account switch). */
   async reset(): Promise<void> {
-    this.subscriptions.clear();
     await this.store.clear();
+    await this.store.clearSubscriptions();
   }
 }

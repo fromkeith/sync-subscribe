@@ -4,39 +4,68 @@ import { decodeSyncToken } from "@sync-subscribe/core";
 import type { SyncStore } from "@sync-subscribe/server";
 import type { NoteRecord } from "./types.js";
 
+type Condition = Record<string, unknown>;
+
 function toSqlValue(v: FilterValue): unknown {
   if (typeof v === "boolean") return v ? 1 : 0;
   return v;
 }
 
 function filterToSql(
-  filter: SubscriptionFilter
+  filter: SubscriptionFilter,
 ): { clauses: string[]; params: unknown[] } {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
   for (const [key, condition] of Object.entries(filter)) {
+    if (key === "$or" || key === "$and") {
+      const branches = condition as SubscriptionFilter[];
+      const parts = branches.map((branch) => {
+        const sub = filterToSql(branch);
+        params.push(...sub.params);
+        return sub.clauses.length > 0
+          ? `(${sub.clauses.join(" AND ")})`
+          : "1=1";
+      });
+      const op = key === "$or" ? " OR " : " AND ";
+      clauses.push(`(${parts.join(op)})`);
+      continue;
+    }
+
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
       throw new Error(`Invalid column name in filter: ${key}`);
     }
+
+    const c = condition as Condition;
+
     if (condition === null || typeof condition !== "object") {
       clauses.push(`"${key}" = ?`);
-      params.push(toSqlValue(condition));
-    } else if ("$gte" in condition) {
+      params.push(toSqlValue(condition as FilterValue));
+    } else if ("$in" in c) {
+      const vals = c.$in as FilterValue[];
+      clauses.push(`"${key}" IN (${vals.map(() => "?").join(", ")})`);
+      params.push(...vals.map(toSqlValue));
+    } else if ("$nin" in c) {
+      const vals = c.$nin as FilterValue[];
+      clauses.push(`"${key}" NOT IN (${vals.map(() => "?").join(", ")})`);
+      params.push(...vals.map(toSqlValue));
+    } else if ("$gte" in c) {
       clauses.push(`"${key}" >= ?`);
-      params.push(toSqlValue(condition.$gte));
-    } else if ("$gt" in condition) {
+      params.push(toSqlValue(c.$gte as FilterValue));
+    } else if ("$gt" in c) {
       clauses.push(`"${key}" > ?`);
-      params.push(toSqlValue(condition.$gt));
-    } else if ("$lte" in condition) {
+      params.push(toSqlValue(c.$gt as FilterValue));
+    } else if ("$lte" in c) {
       clauses.push(`"${key}" <= ?`);
-      params.push(toSqlValue(condition.$lte));
-    } else if ("$lt" in condition) {
+      params.push(toSqlValue(c.$lte as FilterValue));
+    } else if ("$lt" in c) {
       clauses.push(`"${key}" < ?`);
-      params.push(toSqlValue(condition.$lt));
-    } else if ("$ne" in condition) {
+      params.push(toSqlValue(c.$lt as FilterValue));
+    } else if ("$ne" in c) {
       clauses.push(`"${key}" != ?`);
-      params.push(toSqlValue(condition.$ne));
+      params.push(toSqlValue(c.$ne as FilterValue));
+    } else if ("$exists" in c) {
+      clauses.push(c.$exists ? `"${key}" IS NOT NULL` : `"${key}" IS NULL`);
     }
   }
 

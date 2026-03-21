@@ -6,11 +6,11 @@ import { useSyncClient } from "./context.js";
 export interface UseRecordsOptions {
   filter: SubscriptionFilter;
   /**
-   * How often to poll the server for new data, in milliseconds.
-   * Set to 0 to disable polling (e.g. when using SSE streaming instead).
-   * Default: 5000.
+   * Stable name for this subscription. When provided, the subscription state
+   * is persisted to the local store and automatically restored on next startup,
+   * enabling incremental sync instead of a full re-fetch.
    */
-  pollInterval?: number;
+  name?: string;
 }
 
 /**
@@ -33,7 +33,7 @@ export interface UseRecordsOptions {
 export function useRecords<T extends SyncRecord>(
   options: UseRecordsOptions,
 ): T[] {
-  const { filter, pollInterval = 5000 } = options;
+  const { filter, name } = options;
   const client = useSyncClient<T>();
 
   const [records, setRecords] = useState<T[]>([]);
@@ -55,13 +55,15 @@ export function useRecords<T extends SyncRecord>(
     );
   }, [client]);
 
-  // Create / update the server subscription and do an initial pull.
+  // Create / update the server subscription, do an initial pull, then stream.
   useEffect(() => {
     let cancelled = false;
+    let stopStream: (() => void) | undefined;
 
     async function init() {
       const sub = await client.subscribe({
         filter: filterRef.current,
+        ...(name !== undefined && { name }),
         ...(subIdRef.current !== undefined && {
           previousSubscriptionId: subIdRef.current,
         }),
@@ -69,13 +71,17 @@ export function useRecords<T extends SyncRecord>(
       subIdRef.current = sub.subscriptionId;
 
       await client.pull();
-      if (!cancelled) await refresh();
+      if (!cancelled) {
+        await refresh();
+        stopStream = client.stream(sub.subscriptionId);
+      }
     }
 
     init().catch(console.error);
 
     return () => {
       cancelled = true;
+      stopStream?.();
     };
     // filterKey stands in for filter — deep-equal stable dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -87,15 +93,6 @@ export function useRecords<T extends SyncRecord>(
       refresh().catch(console.error);
     });
   }, [client, refresh]);
-
-  // Polling.
-  useEffect(() => {
-    if (pollInterval <= 0) return;
-    const timer = setInterval(() => {
-      client.pull().catch(() => {});
-    }, pollInterval);
-    return () => clearInterval(timer);
-  }, [client, pollInterval]);
 
   return records;
 }

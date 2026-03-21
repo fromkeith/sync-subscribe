@@ -1,6 +1,6 @@
-import type { SyncRecord, SyncPatch } from "@sync-subscribe/core";
-import { resolveConflict } from "@sync-subscribe/core";
-import type { ILocalStore } from "./types.js";
+import type { SyncRecord, SyncPatch, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
+import { resolveConflict, matchesFilter } from "@sync-subscribe/core";
+import type { ILocalStore, PersistedSubscription } from "./types.js";
 
 /**
  * IndexedDB-backed local store. Records survive page reloads.
@@ -24,10 +24,16 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     if (this.db) return Promise.resolve(this.db);
 
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(this.dbName, 1);
+      const req = indexedDB.open(this.dbName, 2);
 
       req.onupgradeneeded = () => {
-        req.result.createObjectStore(this.storeName, { keyPath: "recordId" });
+        const db = req.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          db.createObjectStore(this.storeName, { keyPath: "recordId" });
+        }
+        if (!db.objectStoreNames.contains("meta")) {
+          db.createObjectStore("meta");
+        }
       };
 
       req.onsuccess = () => {
@@ -126,6 +132,88 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(this.storeName, "readwrite");
       tx.objectStore(this.storeName).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async setSyncToken(subscriptionId: string, token: SyncToken): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readwrite");
+      tx.objectStore("meta").put(token, `syncToken:${subscriptionId}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async getSyncToken(subscriptionId: string): Promise<SyncToken | undefined> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readonly");
+      const req = tx.objectStore("meta").get(`syncToken:${subscriptionId}`);
+      req.onsuccess = () => resolve(req.result as SyncToken | undefined);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async setSubscription(name: string, sub: PersistedSubscription): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readwrite");
+      tx.objectStore("meta").put(sub, `subscription:${name}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async getSubscription(name: string): Promise<PersistedSubscription | undefined> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readonly");
+      const req = tx.objectStore("meta").get(`subscription:${name}`);
+      req.onsuccess = () => resolve(req.result as PersistedSubscription | undefined);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async removeSubscription(name: string): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readwrite");
+      tx.objectStore("meta").delete(`subscription:${name}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async clearSubscriptions(): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readwrite");
+      tx.objectStore("meta").clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async evict(evictFilter: SubscriptionFilter, retainFilters: SubscriptionFilter[]): Promise<void> {
+    const all = await this.getAll();
+    const toDelete = all.filter(
+      (record) =>
+        matchesFilter(record as Record<string, unknown>, evictFilter) &&
+        !retainFilters.some((f) => matchesFilter(record as Record<string, unknown>, f)),
+    );
+
+    if (toDelete.length === 0) return;
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, "readwrite");
+      const store = tx.objectStore(this.storeName);
+      for (const record of toDelete) {
+        store.delete(record.recordId);
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

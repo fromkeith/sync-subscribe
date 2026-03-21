@@ -1,10 +1,13 @@
 export { SyncClient } from "./syncClient.js";
-export { LocalStore } from "./localStore.js";
+export { InMemoryStore } from "./inMemoryStore.js";
 export { IdbLocalStore } from "./idbLocalStore.js";
+export { createFetchTransport } from "./fetchTransport.js";
+export type { FetchTransportOptions } from "./fetchTransport.js";
 export type {
   ClientSubscription,
   ClientSubscriptionOptions,
   ILocalStore,
   PatchListener,
+  PersistedSubscription,
   SyncTransport,
 } from "./types.js";

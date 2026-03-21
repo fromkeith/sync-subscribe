@@ -26,9 +26,11 @@ export default function App() {
   // Both share the same LocalStore so overlapping records are stored once.
   const recentNotes = useRecords<NoteRecord>({
     filter: { createdAt: { $gte: thirtyDaysAgo } },
+    name: "recent-notes",
   });
   const blueNotes = useRecords<NoteRecord>({
     filter: { color: "blue" },
+    name: "blue-notes",
   });
 
   // Merge both views into one deduped list (by recordId), excluding deleted.
@@ -41,13 +43,17 @@ export default function App() {
   }, [recentNotes, blueNotes]);
 
   const visibleNotes = useMemo(() => {
-    if (tab === "recent") return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo);
+    if (tab === "recent")
+      return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo);
     if (tab === "blue") return allNotes.filter((n) => n.color === "blue");
     return allNotes;
   }, [tab, allNotes, thirtyDaysAgo]);
 
   async function handleCreate(
-    data: Omit<NoteRecord, "recordId" | "createdAt" | "updatedAt" | "revisionCount" | "userId">
+    data: Omit<
+      NoteRecord,
+      "recordId" | "createdAt" | "updatedAt" | "revisionCount" | "userId"
+    >,
   ) {
     await mutate({
       recordId: crypto.randomUUID(),
@@ -70,7 +76,8 @@ export default function App() {
   }
 
   const countFor = (t: Tab) => {
-    if (t === "recent") return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo).length;
+    if (t === "recent")
+      return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo).length;
     if (t === "blue") return allNotes.filter((n) => n.color === "blue").length;
     return allNotes.length;
   };
@@ -78,7 +85,14 @@ export default function App() {
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 16px" }}>
       {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          marginBottom: 24,
+        }}
+      >
         <h1 style={{ fontSize: 24, fontWeight: 700, flex: 1 }}>Notes</h1>
         <button
           onClick={() => setShowCreate(true)}
@@ -137,7 +151,10 @@ export default function App() {
 
       {/* Create modal */}
       {showCreate && (
-        <CreateNoteForm onSubmit={handleCreate} onCancel={() => setShowCreate(false)} />
+        <CreateNoteForm
+          onSubmit={handleCreate}
+          onCancel={() => setShowCreate(false)}
+        />
       )}
     </div>
   );
