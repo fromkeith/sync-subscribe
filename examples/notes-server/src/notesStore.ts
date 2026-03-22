@@ -78,6 +78,7 @@ function rowToNote(row: Record<string, unknown>): NoteRecord {
     userId: row["userId"] as string,
     createdAt: row["createdAt"] as number,
     updatedAt: row["updatedAt"] as number,
+    ...(row["serverUpdatedAt"] != null && { serverUpdatedAt: row["serverUpdatedAt"] as number }),
     revisionCount: row["revisionCount"] as number,
     color: (row["color"] as string | null) ?? null,
     category: (row["category"] as string | null) ?? null,
@@ -92,32 +93,45 @@ export class NotesStore implements SyncStore<NoteRecord> {
   constructor(private readonly db: Database.Database) {}
 
   async getRecordsSince(
-    filter: SubscriptionFilter,
-    since: SyncToken
+    subscriptions: { filter: SubscriptionFilter; since: SyncToken }[],
   ): Promise<SyncPatch<NoteRecord>[]> {
-    const token = decodeSyncToken(since);
-    const { clauses, params } = filterToSql(filter);
+    if (subscriptions.length === 0) return [];
 
-    if (token) {
-      clauses.push(`(
-        "updatedAt" > ? OR
-        ("updatedAt" = ? AND "revisionCount" > ?) OR
-        ("updatedAt" = ? AND "revisionCount" = ? AND "recordId" > ?)
-      )`);
-      params.push(
-        token.updatedAt,
-        token.updatedAt, token.revisionCount,
-        token.updatedAt, token.revisionCount, token.recordId
-      );
+    // Build one query using a union of all filters, each scoped to its own since-token.
+    // Use the earliest (smallest) since-token to keep the query simple, then rely on
+    // SyncHandler to compute per-subscription syncTokens from the returned patches.
+    const allClauses: string[] = [];
+    const allParams: unknown[] = [];
+
+    for (const { filter, since } of subscriptions) {
+      const token = decodeSyncToken(since);
+      const { clauses, params } = filterToSql(filter);
+
+      if (token) {
+        clauses.push(`(
+          "updatedAt" > ? OR
+          ("updatedAt" = ? AND "revisionCount" > ?) OR
+          ("updatedAt" = ? AND "revisionCount" = ? AND "recordId" > ?)
+        )`);
+        params.push(
+          token.updatedAt,
+          token.updatedAt, token.revisionCount,
+          token.updatedAt, token.revisionCount, token.recordId,
+        );
+      }
+
+      const subWhere = clauses.length ? clauses.join(" AND ") : "1=1";
+      allClauses.push(`(${subWhere})`);
+      allParams.push(...params);
     }
 
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const where = `WHERE ${allClauses.join(" OR ")}`;
     const rows = this.db
       .prepare(
-        `SELECT * FROM notes ${where}
-         ORDER BY "updatedAt" ASC, "revisionCount" ASC, "recordId" ASC`
+        `SELECT DISTINCT * FROM notes ${where}
+         ORDER BY "updatedAt" ASC, "revisionCount" ASC, "recordId" ASC`,
       )
-      .all(params) as Record<string, unknown>[];
+      .all(allParams) as Record<string, unknown>[];
 
     return rows.map((row) => ({ op: "upsert", record: rowToNote(row) }));
   }
@@ -126,22 +140,27 @@ export class NotesStore implements SyncStore<NoteRecord> {
     this.db
       .prepare(
         `INSERT INTO notes
-           (recordId, userId, createdAt, updatedAt, revisionCount,
+           (recordId, userId, createdAt, updatedAt, serverUpdatedAt, revisionCount,
             color, category, isDeleted, fontFamily, title, contents)
          VALUES
-           (@recordId, @userId, @createdAt, @updatedAt, @revisionCount,
+           (@recordId, @userId, @createdAt, @updatedAt, @serverUpdatedAt, @revisionCount,
             @color, @category, @isDeleted, @fontFamily, @title, @contents)
          ON CONFLICT(recordId) DO UPDATE SET
-           updatedAt     = excluded.updatedAt,
-           revisionCount = excluded.revisionCount,
-           color         = excluded.color,
-           category      = excluded.category,
-           isDeleted     = excluded.isDeleted,
-           fontFamily    = excluded.fontFamily,
-           title         = excluded.title,
-           contents      = excluded.contents`
+           updatedAt       = excluded.updatedAt,
+           serverUpdatedAt = excluded.serverUpdatedAt,
+           revisionCount   = excluded.revisionCount,
+           color           = excluded.color,
+           category        = excluded.category,
+           isDeleted       = excluded.isDeleted,
+           fontFamily      = excluded.fontFamily,
+           title           = excluded.title,
+           contents        = excluded.contents`,
       )
-      .run({ ...record, isDeleted: record.isDeleted ? 1 : 0 });
+      .run({
+        ...record,
+        isDeleted: record.isDeleted ? 1 : 0,
+        serverUpdatedAt: record.serverUpdatedAt ?? null,
+      });
     return record;
   }
 

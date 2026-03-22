@@ -11,6 +11,8 @@ export type {
   PullResponse,
   PushRequest,
   PushResponse,
+  StreamEvent,
+  StreamRequest,
   SyncHandlerOptions,
   SyncStore,
   SubscriptionStore,

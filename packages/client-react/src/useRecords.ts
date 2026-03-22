@@ -60,6 +60,14 @@ export function useRecords<T extends SyncRecord>(
     let cancelled = false;
     let stopStream: (() => void) | undefined;
 
+    async function startStream() {
+      await client.pull();
+      if (!cancelled) {
+        await refresh();
+        stopStream = client.stream();
+      }
+    }
+
     async function init() {
       const sub = await client.subscribe({
         filter: filterRef.current,
@@ -70,10 +78,20 @@ export function useRecords<T extends SyncRecord>(
       });
       subIdRef.current = sub.subscriptionId;
 
-      await client.pull();
-      if (!cancelled) {
-        await refresh();
-        stopStream = client.stream(sub.subscriptionId);
+      await client.schedulePull();
+      if (cancelled) return;
+      await refresh();
+
+      if ((sub.status ?? "active") === "active") {
+        stopStream = client.stream();
+      } else {
+        // Subscription is pending gap fill — start stream once it becomes active.
+        const unsub = client.onSubscriptionActive(sub.subscriptionId, () => {
+          unsub();
+          if (!cancelled) {
+            startStream().catch(console.error);
+          }
+        });
       }
     }
 

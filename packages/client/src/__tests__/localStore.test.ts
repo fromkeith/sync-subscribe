@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryStore } from "../inMemoryStore.js";
-import type { SyncRecord } from "@sync-subscribe/core";
+import { EMPTY_SYNC_TOKEN, type SyncRecord } from "@sync-subscribe/core";
 
 interface TestRecord extends SyncRecord {
   value: string;
@@ -58,32 +58,38 @@ describe("InMemoryStore", () => {
 });
 
 describe("evict", () => {
-  it("removes records matching the evict filter when no retain filter covers them", async () => {
+  it("removes records matching the evict filter when no subscription covers them", async () => {
     const store = new InMemoryStore<TestRecord>();
     await store.write(rec({ recordId: "r1", value: "blue" }));
     await store.write(rec({ recordId: "r2", value: "red" }));
 
-    await store.evict({ value: "blue" }, []);
+    await store.evict({ value: "blue" });
 
     expect(await store.getById("r1")).toBeUndefined();
     expect(await store.getById("r2")).toMatchObject({ value: "red" });
   });
 
-  it("keeps records that are covered by a retain filter", async () => {
+  it("removes records matching the filter regardless of subscriptions", async () => {
     const store = new InMemoryStore<TestRecord>();
     await store.write(rec({ recordId: "r1", value: "blue" }));
 
-    // r1 matches evictFilter but also matches a retain filter — keep it
-    await store.evict({ value: "blue" }, [{ value: "blue" }]);
+    // evict is unconditional — caller is responsible for computing the safe gap filter
+    await store.setSubscription("some-sub", {
+      subscriptionId: "some-sub",
+      filter: { value: "blue" },
+      syncToken: EMPTY_SYNC_TOKEN,
+    });
 
-    expect(await store.getById("r1")).toBeDefined();
+    await store.evict({ value: "blue" });
+
+    expect(await store.getById("r1")).toBeUndefined();
   });
 
   it("keeps records that do not match the evict filter", async () => {
     const store = new InMemoryStore<TestRecord>();
     await store.write(rec({ recordId: "r1", value: "red" }));
 
-    await store.evict({ value: "blue" }, []);
+    await store.evict({ value: "blue" });
 
     expect(await store.getById("r1")).toBeDefined();
   });

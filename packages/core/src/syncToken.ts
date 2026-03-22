@@ -6,12 +6,24 @@ interface TokenPayload {
   recordId: string;
 }
 
+const toBase64 =
+  globalThis.btoa ||
+  ((a: string) => globalThis.Buffer.from(a).toString("base64url"));
+const fromBase64 =
+  globalThis.atob ||
+  ((a: string) => globalThis.Buffer.from(a, "base64url").toString("utf8"));
+
 /**
  * Encodes a sync token from its constituent parts.
  * Format: base64(JSON({ updatedAt, revisionCount, recordId }))
+ *
+ * When reconstructing a token from local data (e.g. to resume a subscription
+ * without a server round-trip), pass `serverUpdatedAt` as the `updatedAt`
+ * argument — NOT the client's local `updatedAt`. The server clock is
+ * authoritative for token comparisons.
  */
 export function encodeSyncToken(payload: TokenPayload): SyncToken {
-  return Buffer.from(JSON.stringify(payload)).toString("base64url") as SyncToken;
+  return toBase64(JSON.stringify(payload)) as SyncToken;
 }
 
 /**
@@ -20,7 +32,7 @@ export function encodeSyncToken(payload: TokenPayload): SyncToken {
 export function decodeSyncToken(token: SyncToken): TokenPayload | null {
   if (!token) return null;
   try {
-    return JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as TokenPayload;
+    return JSON.parse(fromBase64(token as string)) as TokenPayload;
   } catch {
     return null;
   }

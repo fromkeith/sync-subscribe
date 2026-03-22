@@ -32,7 +32,9 @@ describe("SubscriptionManager", () => {
 
     expect(resetRequired).toBe(false);
     expect(subscription.syncToken).toBe(token);
-    expect(mgr.get(original.subscriptionId)).toBeUndefined(); // old one removed
+    // update is in-place: same subscriptionId is preserved
+    expect(mgr.get(original.subscriptionId)).toBeDefined();
+    expect(mgr.get(original.subscriptionId)?.subscriptionId).toBe(original.subscriptionId);
   });
 
   it("update with different filter resets syncToken (full sync)", async () => {

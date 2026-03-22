@@ -5,27 +5,53 @@ import NotesList from "./components/NotesList.js";
 import CreateNoteForm from "./components/CreateNoteForm.js";
 
 type Tab = "all" | "recent" | "blue";
+type RecentRange = "1d" | "2d" | "1w" | "1m" | "2m" | "all";
 
-const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+const DAY = 24 * 60 * 60 * 1000;
+
+const RANGE_MS: Record<RecentRange, number | null> = {
+  "1d": 1 * DAY,
+  "2d": 2 * DAY,
+  "1w": 7 * DAY,
+  "1m": 30 * DAY,
+  "2m": 60 * DAY,
+  all: null,
+};
+
+const RANGE_LABELS: Record<RecentRange, string> = {
+  "1d": "Last day",
+  "2d": "Last 2 days",
+  "1w": "Last week",
+  "1m": "Last month",
+  "2m": "Last 2 months",
+  all: "All time",
+};
 
 const tabLabel: Record<Tab, string> = {
-  all: "All Notes",
-  recent: "Recent (30 days)",
+  all: "All Local Notes",
+  recent: "Recent",
   blue: "Blue Notes",
 };
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("all");
+  const [tab, setTab] = useState<Tab>("recent");
+  const [recentRange, setRecentRange] = useState<RecentRange>("1m");
   const [showCreate, setShowCreate] = useState(false);
   const mutate = useMutate<NoteRecord>();
 
-  // Stable cutoff so the filter doesn't change identity on every render.
-  const thirtyDaysAgo = useMemo(() => Date.now() - THIRTY_DAYS, []);
+  // Recompute cutoff only when range changes, not on every render.
+  const cutoff = useMemo(() => {
+    const ms = RANGE_MS[recentRange];
+    return ms !== null ? Date.now() - ms : null;
+  }, [recentRange]);
 
-  // Two server-side subscriptions, mirroring the original design.
-  // Both share the same LocalStore so overlapping records are stored once.
+  const recentFilter = useMemo(
+    () => (cutoff !== null ? { createdAt: { $gte: cutoff } } : {}),
+    [cutoff],
+  );
+
   const recentNotes = useRecords<NoteRecord>({
-    filter: { createdAt: { $gte: thirtyDaysAgo } },
+    filter: recentFilter,
     name: "recent-notes",
   });
   const blueNotes = useRecords<NoteRecord>({
@@ -33,7 +59,6 @@ export default function App() {
     name: "blue-notes",
   });
 
-  // Merge both views into one deduped list (by recordId), excluding deleted.
   const allNotes = useMemo(() => {
     const map = new Map<string, NoteRecord>();
     for (const n of [...recentNotes, ...blueNotes]) {
@@ -43,11 +68,10 @@ export default function App() {
   }, [recentNotes, blueNotes]);
 
   const visibleNotes = useMemo(() => {
-    if (tab === "recent")
-      return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo);
-    if (tab === "blue") return allNotes.filter((n) => n.color === "blue");
+    if (tab === "recent") return recentNotes.filter((n) => !n.isDeleted);
+    if (tab === "blue") return blueNotes.filter((n) => !n.isDeleted);
     return allNotes;
-  }, [tab, allNotes, thirtyDaysAgo]);
+  }, [tab, allNotes, recentNotes, blueNotes]);
 
   async function handleCreate(
     data: Omit<
@@ -62,7 +86,7 @@ export default function App() {
       updatedAt: Date.now(),
       revisionCount: 1,
       ...data,
-    });
+    } as NoteRecord);
     setShowCreate(false);
   }
 
@@ -76,9 +100,8 @@ export default function App() {
   }
 
   const countFor = (t: Tab) => {
-    if (t === "recent")
-      return allNotes.filter((n) => n.createdAt >= thirtyDaysAgo).length;
-    if (t === "blue") return allNotes.filter((n) => n.color === "blue").length;
+    if (t === "recent") return recentNotes.filter((n) => !n.isDeleted).length;
+    if (t === "blue") return blueNotes.filter((n) => !n.isDeleted).length;
     return allNotes.length;
   };
 
@@ -112,7 +135,13 @@ export default function App() {
       </div>
 
       {/* Subscription tabs */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 20 }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 4,
+          marginBottom: tab === "recent" ? 12 : 20,
+        }}
+      >
         {(["all", "recent", "blue"] as Tab[]).map((t) => (
           <button
             key={t}
@@ -145,6 +174,31 @@ export default function App() {
           </button>
         ))}
       </div>
+
+      {/* Recent range selector — only visible on the recent tab */}
+      {tab === "recent" && (
+        <div style={{ display: "flex", gap: 4, marginBottom: 20 }}>
+          {(Object.keys(RANGE_LABELS) as RecentRange[]).map((r) => (
+            <button
+              key={r}
+              onClick={() => setRecentRange(r)}
+              style={{
+                padding: "5px 12px",
+                border: `1.5px solid ${recentRange === r ? "#3b82f6" : "#e2e8f0"}`,
+                borderRadius: 6,
+                cursor: "pointer",
+                fontWeight: recentRange === r ? 600 : 400,
+                background: recentRange === r ? "#eff6ff" : "#fff",
+                color: recentRange === r ? "#2563eb" : "#64748b",
+                fontSize: 12,
+                transition: "all 0.15s",
+              }}
+            >
+              {RANGE_LABELS[r]}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Notes grid */}
       <NotesList notes={visibleNotes} onDelete={handleDelete} />

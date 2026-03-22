@@ -1,4 +1,6 @@
+import { z } from "zod";
 import type { SyncRecord } from "@sync-subscribe/core";
+import type { TableSchema } from "@sync-subscribe/core";
 
 export interface NoteRecord extends SyncRecord {
   userId: string;
@@ -9,6 +11,25 @@ export interface NoteRecord extends SyncRecord {
   title: string;
   contents: string;
 }
+
+export const noteSchema: TableSchema<NoteRecord> = {
+  schema: z.object({
+    recordId: z.string(),
+    userId: z.string(),
+    createdAt: z.number(),
+    updatedAt: z.number(),
+    revisionCount: z.number(),
+    color: z.string().nullable(),
+    category: z.string().nullable(),
+    isDeleted: z.boolean(),
+    fontFamily: z.string().nullable(),
+    title: z.string(),
+    contents: z.string(),
+  }),
+  tableName: "notes",
+  recordId: "recordId",
+  indexes: [["userId"], ["isDeleted"], ["updatedAt"]],
+};
 
 export const COLORS = ["blue", "green", "red", "yellow", "purple"] as const;
 export type NoteColor = (typeof COLORS)[number];

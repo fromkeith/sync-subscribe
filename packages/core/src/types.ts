@@ -6,6 +6,11 @@ export interface SyncRecord {
   recordId: string;
   createdAt: number; // unix ms
   updatedAt: number; // unix ms — client stores local time, server stores server time
+  /**
+   * The server's `updatedAt` at the time this record was last confirmed by the server.
+   * Unset until the first server sync. Used to reconstruct sync tokens from local data.
+   */
+  serverUpdatedAt?: number;
   revisionCount: number; // incremented on every mutation; used for conflict resolution
   /** Index signature so that T extends SyncRecord satisfies Record<string, unknown>. */
   [key: string]: unknown;
@@ -64,4 +69,39 @@ export type SyncPatch<T extends SyncRecord> =
 export interface ConflictResult<T extends SyncRecord> {
   conflict: true;
   serverRecord: T;
+}
+
+// ---------------------------------------------------------------------------
+// Protocol types — shared by client transport and server handler
+// ---------------------------------------------------------------------------
+
+export interface PullRequest {
+  subscriptions: { id: string; syncToken: SyncToken }[];
+}
+
+export interface PullResponse<T extends SyncRecord = SyncRecord> {
+  patches: SyncPatch<T>[];
+  /** One token per subscription whose data window was affected. */
+  syncTokens: Record<string, SyncToken>;
+}
+
+export interface PushRequest<T extends SyncRecord = SyncRecord> {
+  records: T[];
+}
+
+export type PushResponse<T extends SyncRecord = SyncRecord> =
+  | { ok: true; serverUpdatedAt: number }
+  | ConflictResult<T>;
+
+/**
+ * Emitted per SSE event on the stream endpoint — same shape as PullResponse.
+ */
+export interface StreamEvent<T extends SyncRecord = SyncRecord> {
+  patches: SyncPatch<T>[];
+  syncTokens: Record<string, SyncToken>;
+}
+
+/** Request body when opening a stream connection. */
+export interface StreamRequest {
+  subscriptions: { id: string; syncToken: SyncToken }[];
 }

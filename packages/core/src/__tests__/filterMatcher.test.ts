@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchesFilter, filterDiff } from "../filterMatcher.js";
+import { matchesFilter, filtersEqual } from "../filterMatcher.js";
 
 describe("matchesFilter", () => {
   it("equality match", () => {
@@ -68,58 +68,50 @@ describe("matchesFilter", () => {
   });
 });
 
-describe("filterDiff", () => {
+describe("filtersEqual", () => {
   it("identical filters are unchanged", () => {
     const f = { color: "blue", userId: "u1" };
-    expect(filterDiff(f, f).unchanged).toBe(true);
+    expect(filtersEqual(f, f)).toBe(true);
   });
 
   it("detects added conditions", () => {
-    const diff = filterDiff({ color: "blue" }, { color: "blue", userId: "u1" });
-    expect(diff.added).toEqual({ userId: "u1" });
-    expect(diff.removed).toEqual({});
-    expect(diff.changed).toEqual({});
-    expect(diff.unchanged).toBe(false);
+    const diff = filtersEqual(
+      { color: "blue" },
+      { color: "blue", userId: "u1" },
+    );
+    expect(diff).toBe(false);
   });
 
   it("detects removed conditions", () => {
-    const diff = filterDiff({ color: "blue", userId: "u1" }, { color: "blue" });
-    expect(diff.removed).toEqual({ userId: "u1" });
-    expect(diff.added).toEqual({});
-    expect(diff.unchanged).toBe(false);
+    const diff = filtersEqual(
+      { color: "blue", userId: "u1" },
+      { color: "blue" },
+    );
+    expect(diff).toBe(false);
   });
 
   it("detects changed conditions (primitive)", () => {
-    const diff = filterDiff({ color: "blue" }, { color: "red" });
-    expect(diff.changed).toEqual({ color: { from: "blue", to: "red" } });
-    expect(diff.added).toEqual({});
-    expect(diff.removed).toEqual({});
-    expect(diff.unchanged).toBe(false);
+    const diff = filtersEqual({ color: "blue" }, { color: "red" });
+    expect(diff).toBe(false);
   });
 
   it("detects changed conditions (operator)", () => {
-    const diff = filterDiff(
+    const diff = filtersEqual(
       { createdAt: { $gte: 1000 } },
       { createdAt: { $gte: 2000 } },
     );
-    expect(diff.changed).toEqual({
-      createdAt: { from: { $gte: 1000 }, to: { $gte: 2000 } },
-    });
-    expect(diff.unchanged).toBe(false);
+    expect(diff).toBe(false);
   });
 
   it("handles mix of added, removed, and changed", () => {
-    const diff = filterDiff(
+    const diff = filtersEqual(
       { color: "blue", category: "work", userId: "u1" },
-      { color: "red",  category: "work", isDeleted: false },
+      { color: "red", category: "work", isDeleted: false },
     );
-    expect(diff.changed).toEqual({ color: { from: "blue", to: "red" } });
-    expect(diff.added).toEqual({ isDeleted: false });
-    expect(diff.removed).toEqual({ userId: "u1" });
-    expect(diff.unchanged).toBe(false);
+    expect(diff).toBe(false);
   });
 
   it("both empty filters are unchanged", () => {
-    expect(filterDiff({}, {}).unchanged).toBe(true);
+    expect(filtersEqual({}, {})).toBe(true);
   });
 });

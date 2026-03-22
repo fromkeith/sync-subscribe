@@ -3,6 +3,7 @@ import type { Request, Response, Router as ExpressRouter } from "express";
 import {
   type SyncToken,
   type SubscriptionFilter,
+  type StreamEvent,
   matchesFilter,
 } from "@sync-subscribe/core";
 import { SubscriptionManager, SyncHandler } from "@sync-subscribe/server";
@@ -15,16 +16,15 @@ export function createRouter(
 ): ExpressRouter {
   const router = Router();
 
-  // SSE client registry: subscriptionId → set of active response streams
-  const sseClients = new Map<string, Set<Response>>();
+  // SSE client registry: one entry per open connection (multiple subscriptions per connection)
+  interface SseConnection {
+    subscriptionIds: string[];
+    res: Response;
+  }
+  const sseConnections = new Set<SseConnection>();
 
-  function sendSse(subscriptionId: string, data: unknown) {
-    const clients = sseClients.get(subscriptionId);
-    if (!clients || clients.size === 0) return;
-    const payload = `data: ${JSON.stringify(data)}\n\n`;
-    for (const res of clients) {
-      res.write(payload);
-    }
+  function sendSseToConnection(conn: SseConnection, data: unknown) {
+    conn.res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
   const syncHandler = new SyncHandler<NoteRecord>(store, subscriptions, {
@@ -34,24 +34,34 @@ export function createRouter(
     // After any successful push, notify SSE clients whose subscription filter
     // matches at least one of the changed records.
     onRecordsChanged: (records) => {
-      for (const [subId] of sseClients) {
-        const sub = subscriptions.get(subId);
-        if (!sub) continue;
+      for (const conn of sseConnections) {
+        const matchingPatches: StreamEvent<NoteRecord>["patches"] = [];
+        const syncTokensMap: Record<string, SyncToken> = {};
 
-        const matching = records.filter((r) =>
-          matchesFilter(r as unknown as Record<string, unknown>, sub.filter),
-        );
-        if (matching.length === 0) continue;
+        for (const subId of conn.subscriptionIds) {
+          const sub = subscriptions.get(subId);
+          if (!sub) continue;
 
-        const patches = matching.map((r) => ({
-          op: "upsert" as const,
-          record: r,
-        }));
-        const lastRecord = matching[matching.length - 1]!;
-        subscriptions.updateSyncToken(subId, lastRecord);
-        const newToken = subscriptions.get(subId)!.syncToken;
+          const matching = records.filter((r) =>
+            matchesFilter(r as unknown as Record<string, unknown>, sub.filter),
+          );
+          if (matching.length === 0) continue;
 
-        sendSse(subId, { patches, syncToken: newToken });
+          const lastRecord = matching[matching.length - 1]!;
+          subscriptions.updateSyncToken(subId, lastRecord);
+          syncTokensMap[subId] = subscriptions.get(subId)!.syncToken;
+
+          for (const r of matching) {
+            matchingPatches.push({ op: "upsert", record: r });
+          }
+        }
+
+        if (matchingPatches.length > 0) {
+          sendSseToConnection(conn, {
+            patches: matchingPatches,
+            syncTokens: syncTokensMap,
+          } satisfies StreamEvent<NoteRecord>);
+        }
       }
     },
   });
@@ -75,50 +85,69 @@ export function createRouter(
     res.json(result);
   });
 
-  // GET /api/sync?subscriptionId=X&syncToken=Y — pull
-  router.get("/sync", async (req: Request, res: Response) => {
-    const { subscriptionId, syncToken } = req.query as {
-      subscriptionId: string;
-      syncToken: string;
+  // DELETE /api/subscriptions/:id — remove a subscription (used to clean up gap subs)
+  router.delete("/subscriptions/:id", async (req: Request, res: Response) => {
+    await subscriptions.delete(req.params["id"] as string);
+    res.status(204).end();
+  });
+
+  // POST /api/sync/pull — pull patches for all requested subscriptions
+  router.post("/sync/pull", async (req: Request, res: Response) => {
+    const { subscriptions: subs } = req.body as {
+      subscriptions: { id: string; syncToken: string }[];
     };
     try {
-      const result = await syncHandler.pull({
-        subscriptionId,
-        syncToken: (syncToken ?? "") as SyncToken,
-      });
-      res.json(result);
+      const allPatches: import("@sync-subscribe/core").SyncPatch<NoteRecord>[] = [];
+      const syncTokens: Record<string, SyncToken> = {};
+      for (const sub of subs) {
+        const result = await syncHandler.pull({
+          subscriptionId: sub.id,
+          syncToken: (sub.syncToken ?? "") as SyncToken,
+        });
+        allPatches.push(...result.patches);
+        syncTokens[sub.id] = result.syncToken;
+      }
+      // Deduplicate patches — last write per recordId wins
+      const patchMap = new Map<string, import("@sync-subscribe/core").SyncPatch<NoteRecord>>();
+      for (const p of allPatches) {
+        const key = p.op === "upsert" ? p.record.recordId : p.recordId;
+        patchMap.set(key, p);
+      }
+      res.json({ patches: [...patchMap.values()], syncTokens });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  // GET /api/sync/stream?subscriptionId=X&syncToken=Y — SSE push stream
-  router.get("/sync/stream", async (req: Request, res: Response) => {
-    const { subscriptionId, syncToken } = req.query as {
-      subscriptionId: string;
-      syncToken?: string;
+  // POST /api/sync/stream — POST-based SSE stream for multiple subscriptions
+  router.post("/sync/stream", async (req: Request, res: Response) => {
+    const { subscriptions: subs } = req.body as {
+      subscriptions: { id: string; syncToken?: string }[];
     };
-
-    const sub = subscriptions.get(subscriptionId);
-    if (!sub) {
-      res
-        .status(400)
-        .json({ error: `Unknown subscription: ${subscriptionId}` });
-      return;
-    }
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
-    // Send the initial batch of records since the client's last syncToken.
+    // Send the initial batch of records since each subscription's last syncToken.
     try {
-      const initial = await syncHandler.pull({
-        subscriptionId,
-        syncToken: (syncToken ?? "") as SyncToken,
-      });
-      res.write(`data: ${JSON.stringify(initial)}\n\n`);
+      const allPatches: import("@sync-subscribe/core").SyncPatch<NoteRecord>[] = [];
+      const syncTokens: Record<string, SyncToken> = {};
+      for (const sub of subs) {
+        const result = await syncHandler.pull({
+          subscriptionId: sub.id,
+          syncToken: (sub.syncToken ?? "") as SyncToken,
+        });
+        allPatches.push(...result.patches);
+        syncTokens[sub.id] = result.syncToken;
+      }
+      const patchMap = new Map<string, import("@sync-subscribe/core").SyncPatch<NoteRecord>>();
+      for (const p of allPatches) {
+        const key = p.op === "upsert" ? p.record.recordId : p.recordId;
+        patchMap.set(key, p);
+      }
+      res.write(`data: ${JSON.stringify({ patches: [...patchMap.values()], syncTokens })}\n\n`);
     } catch (err) {
       res.write(
         `data: ${JSON.stringify({ error: (err as Error).message })}\n\n`,
@@ -126,10 +155,11 @@ export function createRouter(
     }
 
     // Register this connection for future push notifications.
-    if (!sseClients.has(subscriptionId)) {
-      sseClients.set(subscriptionId, new Set());
-    }
-    sseClients.get(subscriptionId)!.add(res);
+    const conn: SseConnection = {
+      subscriptionIds: subs.map((s) => s.id),
+      res,
+    };
+    sseConnections.add(conn);
 
     const heartbeat = setInterval(() => {
       res.write(": heartbeat\n\n");
@@ -137,28 +167,27 @@ export function createRouter(
 
     req.on("close", () => {
       clearInterval(heartbeat);
-      sseClients.get(subscriptionId)?.delete(res);
+      sseConnections.delete(conn);
     });
   });
 
-  // POST /api/sync — push records from client
-  router.post("/sync", async (req: Request, res: Response) => {
-    const { subscriptionId, records } = req.body as {
-      subscriptionId: string;
+  // POST /api/sync/push — push records from client
+  router.post("/sync/push", async (req: Request, res: Response) => {
+    const { records } = req.body as {
       records: NoteRecord[];
     };
 
     // userId is always injected from the server's auth context.
-    // Clients cannot forge or override it — server-stamped field.
     const userId = getUserId(req);
     const sanitized = records.map((r) => ({ ...r, userId }));
 
     try {
-      const result = await syncHandler.push({
-        subscriptionId,
-        records: sanitized,
-      });
-      res.json(result);
+      const result = await syncHandler.push({ records: sanitized });
+      if ("ok" in result) {
+        res.json({ ok: true, serverUpdatedAt: Date.now() });
+      } else {
+        res.json(result);
+      }
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }

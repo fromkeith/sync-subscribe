@@ -1,5 +1,15 @@
-import type { SyncRecord, SyncPatch, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
-import { resolveConflict, matchesFilter } from "@sync-subscribe/core";
+import type {
+  SyncRecord,
+  SyncPatch,
+  SyncToken,
+  SubscriptionFilter,
+} from "@sync-subscribe/core";
+import {
+  resolveConflict,
+  matchesFilter,
+  encodeSyncToken,
+  EMPTY_SYNC_TOKEN,
+} from "@sync-subscribe/core";
 import type { ILocalStore, PersistedSubscription } from "./types.js";
 
 /**
@@ -47,7 +57,8 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
 
   /**
    * Apply a batch of patches inside a single readwrite transaction.
-   * Conflict resolution mirrors LocalStore: server patch wins only when its
+   * Copies `record.updatedAt` into `record.serverUpdatedAt` on upsert (server clock is authoritative).
+   * Conflict resolution mirrors InMemoryStore: server patch wins only when its
    * revisionCount is higher (or equal with an older updatedAt).
    */
   async applyPatches(patches: SyncPatch<T>[]): Promise<SyncPatch<T>[]> {
@@ -78,8 +89,13 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
           getReq.onsuccess = () => {
             const existing = getReq.result as T | undefined;
             if (!existing || resolveConflict(patch.record, existing) === "a") {
-              store.put(patch.record);
-              applied.push(patch);
+              // Stamp serverUpdatedAt from the server's updatedAt
+              const withServerTs: T = {
+                ...patch.record,
+                serverUpdatedAt: patch.record.updatedAt,
+              };
+              store.put(withServerTs);
+              applied.push({ op: "upsert", record: withServerTs });
             }
             onPatchDone();
           };
@@ -115,6 +131,17 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     });
   }
 
+  async query(filter: SubscriptionFilter): Promise<T[]> {
+    const all = await this.getAll();
+    return all.filter((r) =>
+      matchesFilter(r as Record<string, unknown>, filter),
+    );
+  }
+
+  async count(filter: SubscriptionFilter): Promise<number> {
+    return (await this.query(filter)).length;
+  }
+
   async getById(recordId: string): Promise<T | undefined> {
     const db = await this.getDb();
 
@@ -137,6 +164,80 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     });
   }
 
+  async delete(filter: SubscriptionFilter): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, "readwrite");
+      const store = tx.objectStore(this.storeName);
+      const req = store.openCursor();
+
+      let deleted = 0;
+
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          if (deleted > 0) console.log(`[IdbLocalStore] evicted ${deleted} records`);
+          return;
+        }
+        if (matchesFilter(cursor.value as Record<string, unknown>, filter)) {
+          cursor.delete();
+          deleted++;
+        }
+        cursor.continue();
+      };
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  }
+
+  async evict(evictFilter: SubscriptionFilter): Promise<void> {
+    return this.delete(evictFilter);
+  }
+
+  async reconstructSyncToken(
+    filter: SubscriptionFilter<T>,
+  ): Promise<SyncToken> {
+    const all = await this.getAll();
+    let best: T | undefined;
+
+    for (const record of all) {
+      if (record.serverUpdatedAt === undefined) continue;
+      if (!matchesFilter(record as Record<string, unknown>, filter)) continue;
+
+      if (
+        !best ||
+        record.serverUpdatedAt > best.serverUpdatedAt! ||
+        (record.serverUpdatedAt === best.serverUpdatedAt &&
+          record.revisionCount > best.revisionCount) ||
+        (record.serverUpdatedAt === best.serverUpdatedAt &&
+          record.revisionCount === best.revisionCount &&
+          record.recordId > best.recordId)
+      ) {
+        best = record;
+      }
+    }
+
+    if (!best || best.serverUpdatedAt === undefined) return EMPTY_SYNC_TOKEN;
+
+    return encodeSyncToken({
+      updatedAt: best.serverUpdatedAt,
+      revisionCount: best.revisionCount,
+      recordId: best.recordId,
+    });
+  }
+
+  async setServerUpdatedAt(
+    recordId: string,
+    serverUpdatedAt: number,
+  ): Promise<void> {
+    const record = await this.getById(recordId);
+    if (record) {
+      await this.write({ ...record, serverUpdatedAt });
+    }
+  }
+
   async setSyncToken(subscriptionId: string, token: SyncToken): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
@@ -157,7 +258,16 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     });
   }
 
-  async setSubscription(name: string, sub: PersistedSubscription): Promise<void> {
+  async setSubscription(
+    name: string,
+    sub: PersistedSubscription,
+  ): Promise<void> {
+    if (sub.filter === undefined) {
+      throw new Error("Missing filter");
+    }
+    if (sub.syncToken === undefined) {
+      throw new Error("Missing syncToken");
+    }
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("meta", "readwrite");
@@ -167,12 +277,45 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     });
   }
 
-  async getSubscription(name: string): Promise<PersistedSubscription | undefined> {
+  async getSubscription(
+    name: string,
+  ): Promise<PersistedSubscription | undefined> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("meta", "readonly");
       const req = tx.objectStore("meta").get(`subscription:${name}`);
-      req.onsuccess = () => resolve(req.result as PersistedSubscription | undefined);
+      req.onsuccess = () =>
+        resolve(req.result as PersistedSubscription | undefined);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async getSubscriptionById(
+    id: string,
+  ): Promise<PersistedSubscription | undefined> {
+    const subs = await this.listSubscriptions();
+    return subs.find((s) => s.subscriptionId === id);
+  }
+
+  async listSubscriptions(): Promise<PersistedSubscription[]> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("meta", "readonly");
+      const store = tx.objectStore("meta");
+      const subs: PersistedSubscription[] = [];
+      const req = store.openCursor();
+
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor) {
+          if (String(cursor.key).startsWith("subscription:")) {
+            subs.push(cursor.value as PersistedSubscription);
+          }
+          cursor.continue();
+        } else {
+          resolve(subs);
+        }
+      };
       req.onerror = () => reject(req.error);
     });
   }
@@ -192,28 +335,6 @@ export class IdbLocalStore<T extends SyncRecord> implements ILocalStore<T> {
     return new Promise((resolve, reject) => {
       const tx = db.transaction("meta", "readwrite");
       tx.objectStore("meta").clear();
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  }
-
-  async evict(evictFilter: SubscriptionFilter, retainFilters: SubscriptionFilter[]): Promise<void> {
-    const all = await this.getAll();
-    const toDelete = all.filter(
-      (record) =>
-        matchesFilter(record as Record<string, unknown>, evictFilter) &&
-        !retainFilters.some((f) => matchesFilter(record as Record<string, unknown>, f)),
-    );
-
-    if (toDelete.length === 0) return;
-
-    const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, "readwrite");
-      const store = tx.objectStore(this.storeName);
-      for (const record of toDelete) {
-        store.delete(record.recordId);
-      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

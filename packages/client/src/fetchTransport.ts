@@ -1,4 +1,4 @@
-import type { SyncRecord, SyncPatch, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
+import type { SyncRecord, SyncPatch, SyncToken, SubscriptionFilter, StreamEvent } from "@sync-subscribe/core";
 import type { SyncTransport, ClientSubscription } from "./types.js";
 
 export interface FetchTransportOptions {
@@ -12,13 +12,13 @@ export interface FetchTransportOptions {
 }
 
 /**
- * A fetch + EventSource-based SyncTransport that works in any modern browser.
+ * A fetch-based SyncTransport that works in any modern browser.
  *
- * Covers all four transport methods:
+ * Endpoints:
  *   - createSubscription  →  PUT  {baseUrl}/subscriptions
- *   - pull               →  GET  {baseUrl}/sync?subscriptionId=&syncToken=
- *   - push               →  POST {baseUrl}/sync
- *   - stream             →  GET  {baseUrl}/sync/stream?subscriptionId=&syncToken=  (SSE)
+ *   - pull               →  POST {baseUrl}/sync/pull
+ *   - push               →  POST {baseUrl}/sync/push
+ *   - stream             →  POST {baseUrl}/sync/stream  (fetch-based SSE)
  *
  * @example
  * const transport = createFetchTransport({
@@ -49,45 +49,85 @@ export function createFetchTransport(options: FetchTransportOptions): SyncTransp
       return res.json();
     },
 
-    async pull(subscriptionId: string, syncToken: SyncToken): Promise<{ patches: SyncPatch<SyncRecord>[]; syncToken: SyncToken }> {
-      const qs = new URLSearchParams({ subscriptionId, syncToken });
-      const res = await fetch(`${baseUrl}/sync?${qs}`, { headers: headers() });
+    async deleteSubscription(subscriptionId: string): Promise<void> {
+      const res = await fetch(`${baseUrl}/subscriptions/${subscriptionId}`, {
+        method: "DELETE",
+        headers: headers(),
+      });
+      if (!res.ok) throw new Error(`Delete subscription failed: ${res.status}`);
+    },
+
+    async pull(subscriptions: { id: string; syncToken: SyncToken }[]): Promise<{ patches: SyncPatch<SyncRecord>[]; syncTokens: Record<string, SyncToken> }> {
+      const res = await fetch(`${baseUrl}/sync/pull`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ subscriptions }),
+      });
       if (!res.ok) throw new Error(`Pull failed: ${res.status}`);
       return res.json();
     },
 
-    async push(subscriptionId: string, records: SyncRecord[]): Promise<{ ok: true } | { conflict: true; serverRecord: SyncRecord }> {
-      const res = await fetch(`${baseUrl}/sync`, {
+    async push(records: SyncRecord[]): Promise<{ ok: true; serverUpdatedAt: number } | { conflict: true; serverRecord: SyncRecord }> {
+      const res = await fetch(`${baseUrl}/sync/push`, {
         method: "POST",
         headers: jsonHeaders(),
-        body: JSON.stringify({ subscriptionId, records }),
+        body: JSON.stringify({ records }),
       });
       if (!res.ok) throw new Error(`Push failed: ${res.status}`);
       return res.json();
     },
 
     stream(
-      subscriptionId: string,
-      syncToken: SyncToken,
-      onMessage: (payload: { patches: SyncPatch<SyncRecord>[]; syncToken: SyncToken }) => void,
+      subscriptions: { id: string; syncToken: SyncToken }[],
+      onMessage: (event: StreamEvent) => void,
       onError?: (err: Error) => void,
     ): () => void {
-      const qs = new URLSearchParams({ subscriptionId, syncToken });
-      const es = new EventSource(`${baseUrl}/sync/stream?${qs}`);
+      const controller = new AbortController();
 
-      es.onmessage = (e: MessageEvent) => {
-        try {
-          onMessage(JSON.parse(e.data as string));
-        } catch (err) {
+      fetch(`${baseUrl}/sync/stream`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ subscriptions }),
+        signal: controller.signal,
+      }).then(async (res) => {
+        if (!res.ok) {
+          onError?.(new Error(`Stream failed: ${res.status}`));
+          return;
+        }
+        if (!res.body) {
+          onError?.(new Error("No response body"));
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                onMessage(JSON.parse(line.slice(6)) as StreamEvent);
+              } catch (err) {
+                onError?.(err instanceof Error ? err : new Error(String(err)));
+              }
+            }
+          }
+        }
+      }).catch((err: unknown) => {
+        if ((err as Error)?.name !== "AbortError") {
           onError?.(err instanceof Error ? err : new Error(String(err)));
         }
-      };
+      });
 
-      es.onerror = () => {
-        onError?.(new Error("SSE connection error"));
-      };
-
-      return () => es.close();
+      return () => controller.abort();
     },
   };
 }

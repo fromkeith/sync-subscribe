@@ -112,8 +112,6 @@ export class SubscriptionManager<T extends SyncRecord> {
     serverAdditions: SubscriptionFilter = {},
   ): Promise<{ subscription: ServerSubscription; resetRequired: boolean }> {
     const old = this.cache.get(previousId);
-    this.cache.delete(previousId);
-    this.store.delete(previousId).catch(console.error);
 
     const newServerFilter: SubscriptionFilter = {
       ...newClientFilter,
@@ -123,11 +121,13 @@ export class SubscriptionManager<T extends SyncRecord> {
       !old || !filtersEqual(old.serverFilter, newServerFilter);
     const syncToken = resetRequired ? EMPTY_SYNC_TOKEN : old!.syncToken;
 
-    const subscription = makeSubscription(
-      newClientFilter,
-      serverAdditions,
+    const subscription: ServerSubscription = {
+      subscriptionId: previousId,
+      clientFilter: newClientFilter,
+      filter: newClientFilter,
+      serverFilter: newServerFilter,
       syncToken,
-    );
+    };
     this.cache.set(subscription.subscriptionId, subscription);
     this.store.save(subscription).catch(console.error);
     return { subscription, resetRequired };
@@ -135,6 +135,15 @@ export class SubscriptionManager<T extends SyncRecord> {
 
   get(subscriptionId: string): ServerSubscription | undefined {
     return this.cache.get(subscriptionId);
+  }
+
+  /**
+   * Removes a subscription. Used by the server to clean up gap subscriptions
+   * once the client signals they have been filled.
+   */
+  async delete(subscriptionId: string): Promise<void> {
+    this.cache.delete(subscriptionId);
+    await this.store.delete(subscriptionId);
   }
 
   /**

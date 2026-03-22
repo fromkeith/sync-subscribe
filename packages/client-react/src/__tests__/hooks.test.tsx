@@ -33,7 +33,7 @@ function makeTransport(): SyncTransport {
       filter,
       syncToken: EMPTY_SYNC_TOKEN,
     })),
-    pull: vi.fn(async () => ({ patches: [], syncToken: EMPTY_SYNC_TOKEN })),
+    pull: vi.fn(async () => ({ patches: [], syncTokens: {} })),
     push: vi.fn(async () => ({ ok: true as const })),
   };
 }
@@ -110,7 +110,7 @@ describe("useRecords", () => {
   it("renders records returned by pull", async () => {
     vi.mocked(transport.pull).mockResolvedValueOnce({
       patches: [{ op: "upsert", record: note() }],
-      syncToken: EMPTY_SYNC_TOKEN,
+      syncTokens: {},
     });
 
     function Inner() {
@@ -225,7 +225,7 @@ describe("useMutate", () => {
     });
 
     expect(result).toBe(true);
-    expect(transport.push).toHaveBeenCalledWith("sub-1", [note()]);
+    expect(transport.push).toHaveBeenCalledWith([note()]);
   });
 
   it("queues mutation and writes locally when offline", async () => {
