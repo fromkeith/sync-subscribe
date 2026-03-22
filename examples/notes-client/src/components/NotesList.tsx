@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type { NoteRecord } from "../types.js";
 import NoteCard from "./NoteCard.js";
 
@@ -21,6 +22,11 @@ export default function NotesList({ notes, onDelete }: Props) {
       </div>
     );
   }
+  const notesSorted = useMemo(() => {
+    return notes.sort((a, b) => {
+      return b.createdAt - a.createdAt;
+    });
+  }, [notes]);
 
   return (
     <div
@@ -30,7 +36,7 @@ export default function NotesList({ notes, onDelete }: Props) {
         gap: 16,
       }}
     >
-      {notes.map((note) => (
+      {notesSorted.map((note) => (
         <NoteCard key={note.recordId} note={note} onDelete={onDelete} />
       ))}
     </div>
