@@ -66,6 +66,7 @@ export interface SyncHandlerOptions<T extends SyncRecord> {
 export interface SubscriptionStore {
   save(subscription: ServerSubscription): Promise<void>;
   get(subscriptionId: string): Promise<ServerSubscription | undefined>;
+  setToken(subscriptionId: string, token: SyncToken): Promise<void>;
   delete(subscriptionId: string): Promise<void>;
   getAll(): Promise<ServerSubscription[]>;
 }

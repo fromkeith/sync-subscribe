@@ -41,7 +41,7 @@ export class SyncHandler<T extends SyncRecord> {
       return { subscriptionId: sub.subscriptionId, filter: clientFilter, syncToken: sub.syncToken, resetRequired: false };
     }
 
-    const old = this.subscriptions.get(previousSubscriptionId);
+    const old = await this.subscriptions.get(previousSubscriptionId);
     const { subscription, resetRequired } = await this.subscriptions.update(
       previousSubscriptionId,
       clientFilter,
@@ -77,7 +77,7 @@ export class SyncHandler<T extends SyncRecord> {
     subscriptionId: string;
     syncToken: SyncToken;
   }): Promise<{ patches: SyncPatch<T>[]; syncToken: SyncToken }> {
-    const sub = this.subscriptions.get(req.subscriptionId);
+    const sub = await this.subscriptions.get(req.subscriptionId);
     if (!sub) throw new Error(`Unknown subscription: ${req.subscriptionId}`);
 
     const patches = await this.store.getRecordsSince([
@@ -91,14 +91,12 @@ export class SyncHandler<T extends SyncRecord> {
           p.op === "upsert" &&
           matchesFilter(p.record as Record<string, unknown>, sub.serverFilter),
       );
-    if (lastMatch && lastMatch.op === "upsert") {
-      this.subscriptions.updateSyncToken(req.subscriptionId, lastMatch.record);
-    }
 
-    return {
-      patches,
-      syncToken: this.subscriptions.get(req.subscriptionId)!.syncToken,
-    };
+    const syncToken = lastMatch && lastMatch.op === "upsert"
+      ? this.subscriptions.updateSyncToken(req.subscriptionId, lastMatch.record)
+      : sub.syncToken;
+
+    return { patches, syncToken };
   }
 
   async push(req: { records: T[] }): Promise<{ ok: true } | ConflictResult<T>> {

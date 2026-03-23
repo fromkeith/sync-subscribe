@@ -4,9 +4,11 @@ import {
   type SyncToken,
   type SubscriptionFilter,
   type StreamEvent,
+  SyncPatch,
   matchesFilter,
 } from "@sync-subscribe/core";
 import { SubscriptionManager, SyncHandler } from "@sync-subscribe/server";
+import type { ServerSubscription } from "@sync-subscribe/server";
 import type { NoteRecord } from "./types.js";
 import type { NotesStore } from "./notesStore.js";
 
@@ -16,9 +18,10 @@ export function createRouter(
 ): ExpressRouter {
   const router = Router();
 
-  // SSE client registry: one entry per open connection (multiple subscriptions per connection)
+  // SSE client registry: one entry per open connection.
+  // Subscriptions are stored by value so fan-out never touches the DB or manager cache.
   interface SseConnection {
-    subscriptionIds: string[];
+    subscriptions: ServerSubscription[];
     res: Response;
   }
   const sseConnections = new Set<SseConnection>();
@@ -33,23 +36,27 @@ export function createRouter(
 
     // After any successful push, notify SSE clients whose subscription filter
     // matches at least one of the changed records.
+    // Uses connection-local subscription objects — no DB or manager cache reads needed.
     onRecordsChanged: (records) => {
       for (const conn of sseConnections) {
         const matchingPatches: StreamEvent<NoteRecord>["patches"] = [];
         const syncTokensMap: Record<string, SyncToken> = {};
 
-        for (const subId of conn.subscriptionIds) {
-          const sub = subscriptions.get(subId);
-          if (!sub) continue;
-
+        for (const sub of conn.subscriptions) {
           const matching = records.filter((r) =>
-            matchesFilter(r as unknown as Record<string, unknown>, sub.filter),
+            matchesFilter(
+              r as unknown as Record<string, unknown>,
+              sub.serverFilter,
+            ),
           );
           if (matching.length === 0) continue;
 
           const lastRecord = matching[matching.length - 1]!;
-          subscriptions.updateSyncToken(subId, lastRecord);
-          syncTokensMap[subId] = subscriptions.get(subId)!.syncToken;
+          const newToken = subscriptions.updateSyncToken(
+            sub.subscriptionId,
+            lastRecord,
+          );
+          syncTokensMap[sub.subscriptionId] = newToken;
 
           for (const r of matching) {
             matchingPatches.push({ op: "upsert", record: r });
@@ -97,7 +104,7 @@ export function createRouter(
       subscriptions: { id: string; syncToken: string }[];
     };
     try {
-      const allPatches: import("@sync-subscribe/core").SyncPatch<NoteRecord>[] = [];
+      const allPatches: SyncPatch<NoteRecord>[] = [];
       const syncTokens: Record<string, SyncToken> = {};
       for (const sub of subs) {
         const result = await syncHandler.pull({
@@ -108,7 +115,7 @@ export function createRouter(
         syncTokens[sub.id] = result.syncToken;
       }
       // Deduplicate patches — last write per recordId wins
-      const patchMap = new Map<string, import("@sync-subscribe/core").SyncPatch<NoteRecord>>();
+      const patchMap = new Map<string, SyncPatch<NoteRecord>>();
       for (const p of allPatches) {
         const key = p.op === "upsert" ? p.record.recordId : p.recordId;
         patchMap.set(key, p);
@@ -132,7 +139,7 @@ export function createRouter(
 
     // Send the initial batch of records since each subscription's last syncToken.
     try {
-      const allPatches: import("@sync-subscribe/core").SyncPatch<NoteRecord>[] = [];
+      const allPatches: SyncPatch<NoteRecord>[] = [];
       const syncTokens: Record<string, SyncToken> = {};
       for (const sub of subs) {
         const result = await syncHandler.pull({
@@ -142,21 +149,29 @@ export function createRouter(
         allPatches.push(...result.patches);
         syncTokens[sub.id] = result.syncToken;
       }
-      const patchMap = new Map<string, import("@sync-subscribe/core").SyncPatch<NoteRecord>>();
+      const patchMap = new Map<string, SyncPatch<NoteRecord>>();
       for (const p of allPatches) {
         const key = p.op === "upsert" ? p.record.recordId : p.recordId;
         patchMap.set(key, p);
       }
-      res.write(`data: ${JSON.stringify({ patches: [...patchMap.values()], syncTokens })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({ patches: [...patchMap.values()], syncTokens })}\n\n`,
+      );
     } catch (err) {
       res.write(
         `data: ${JSON.stringify({ error: (err as Error).message })}\n\n`,
       );
     }
 
-    // Register this connection for future push notifications.
+    // Load subscription objects and register this connection for future push notifications.
+    // Holding the objects (not just IDs) means fan-out never touches the DB or manager cache.
+    const loadedSubs = await Promise.all(
+      subs.map((s) => subscriptions.get(s.id)),
+    );
     const conn: SseConnection = {
-      subscriptionIds: subs.map((s) => s.id),
+      subscriptions: loadedSubs.filter(
+        (s): s is ServerSubscription => s !== undefined,
+      ),
       res,
     };
     sseConnections.add(conn);

@@ -50,6 +50,12 @@ export class SqliteSubscriptionStore implements SubscriptionStore {
     return row ? rowToSub(row) : undefined;
   }
 
+  async setToken(subscriptionId: string, token: string): Promise<void> {
+    this.db
+      .prepare("UPDATE subscriptions SET syncToken = ? WHERE subscriptionId = ?")
+      .run(token, subscriptionId);
+  }
+
   async delete(subscriptionId: string): Promise<void> {
     this.db
       .prepare("DELETE FROM subscriptions WHERE subscriptionId = ?")

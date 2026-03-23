@@ -1,7 +1,5 @@
-export {
-  SubscriptionManager,
-  InMemorySubscriptionStore,
-} from "./subscriptionManager.js";
+export { SubscriptionManager } from "./subscriptionManager.js";
+export { InMemorySubscriptionStore } from "./inMemoryStore.js";
 export { SyncHandler } from "./syncHandler.js";
 export type {
   ServerSubscription,

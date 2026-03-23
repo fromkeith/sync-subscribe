@@ -12,9 +12,10 @@ const PORT = 3001;
 const db = openDb();
 const store = new NotesStore(db);
 
-// Warm the in-memory subscription cache from SQLite before accepting requests.
-const subscriptions = new SubscriptionManager<NoteRecord>(new SqliteSubscriptionStore(db));
-await subscriptions.initialize();
+// Subscriptions are loaded on demand (lazy) — no bulk pre-load needed.
+const subscriptions = new SubscriptionManager<NoteRecord>(
+  new SqliteSubscriptionStore(db),
+);
 
 const app = express();
 

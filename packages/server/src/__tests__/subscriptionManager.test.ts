@@ -19,10 +19,9 @@ describe("SubscriptionManager", () => {
     const mgr = new SubscriptionManager<R>();
     const original = await mgr.create({ color: "blue" }, { userId: "u1" });
     // Manually advance the token
-    mgr.updateSyncToken(original.subscriptionId, {
+    const token = mgr.updateSyncToken(original.subscriptionId, {
       recordId: "r1", updatedAt: 999, revisionCount: 1, createdAt: 0,
     });
-    const token = mgr.get(original.subscriptionId)!.syncToken;
 
     const { subscription, resetRequired } = await mgr.update(
       original.subscriptionId,
@@ -33,8 +32,8 @@ describe("SubscriptionManager", () => {
     expect(resetRequired).toBe(false);
     expect(subscription.syncToken).toBe(token);
     // update is in-place: same subscriptionId is preserved
-    expect(mgr.get(original.subscriptionId)).toBeDefined();
-    expect(mgr.get(original.subscriptionId)?.subscriptionId).toBe(original.subscriptionId);
+    expect(await mgr.get(original.subscriptionId)).toBeDefined();
+    expect((await mgr.get(original.subscriptionId))?.subscriptionId).toBe(original.subscriptionId);
   });
 
   it("update with different filter resets syncToken (full sync)", async () => {
