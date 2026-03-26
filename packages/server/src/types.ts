@@ -3,7 +3,6 @@ import type {
   SyncPatch,
   SyncRecord,
   SyncToken,
-  Subscription,
   SubscriptionFilter,
 } from "@sync-subscribe/core";
 
@@ -16,31 +15,6 @@ export type {
   StreamEvent,
   StreamRequest,
 } from "@sync-subscribe/core";
-
-/** A stored subscription on the server, augmented with server-side filter addons. */
-export interface ServerSubscription extends Subscription {
-  /** Client-supplied portion of the filter. Sent back to the client as `filter`. */
-  clientFilter: SubscriptionFilter;
-  /**
-   * Complete effective filter used for server-side queries.
-   * Includes all clientFilter fields plus any server-enforced additions (e.g. accountId).
-   * clientFilter ⊆ serverFilter. Never sent to the client.
-   */
-  serverFilter: SubscriptionFilter;
-}
-
-export interface CreateSubscriptionResponse {
-  subscriptionId: string;
-  /** The client-supplied filter, echoed back so the client can store it. */
-  filter: SubscriptionFilter;
-  syncToken: SyncToken;
-  /**
-   * True when the filter changed on update and the client should evict
-   * data that no longer matches the new filter, then do a full re-sync.
-   * Always false for brand-new subscriptions.
-   */
-  resetRequired: boolean;
-}
 
 export interface SyncHandlerOptions<T extends SyncRecord> {
   /**
@@ -57,25 +31,14 @@ export interface SyncHandlerOptions<T extends SyncRecord> {
 }
 
 /**
- * Persistence interface for server-side subscriptions.
- *
- * The default SubscriptionManager keeps subscriptions in-memory only, so they
- * are lost on server restart. Provide a SubscriptionStore implementation backed
- * by your database to survive restarts.
+ * One entry in a pull or stream request.
+ * key is an opaque client-assigned identifier echoed back in the syncTokens response.
+ * filter has already had server-side additions merged in by the route handler.
  */
-export interface SubscriptionStore {
-  save(subscription: ServerSubscription): Promise<void>;
-  get(subscriptionId: string): Promise<ServerSubscription | undefined>;
-  setToken(subscriptionId: string, token: SyncToken): Promise<void>;
-  delete(subscriptionId: string): Promise<void>;
-  getAll(): Promise<ServerSubscription[]>;
-}
-
-/** Request body for PUT /subscriptions (create or update) */
-export interface UpdateSubscriptionRequest {
-  clientFilter: SubscriptionFilter;
-  serverAdditions?: SubscriptionFilter;
-  previousSubscriptionId?: string;
+export interface SyncSubscriptionRequest {
+  key: string;
+  filter: SubscriptionFilter;
+  syncToken: SyncToken;
 }
 
 /**
@@ -84,9 +47,10 @@ export interface UpdateSubscriptionRequest {
  */
 export interface SyncStore<T extends SyncRecord> {
   /**
-   * Fetch records matching one or more subscription filters, each with its own
+   * Fetch records matching one or more subscription requests, each with its own
    * since-token. Implementations should query using a union of all filters
-   * and return deduplicated patches ordered by (updatedAt, revisionCount, recordId) ascending.
+   * and return patches ordered by (updatedAt, revisionCount, recordId) ascending.
+   * Deduplication across subscriptions is handled by SyncHandler.
    */
   getRecordsSince(
     subscriptions: { filter: SubscriptionFilter; since: SyncToken }[],

@@ -18,6 +18,7 @@ import type {
   PatchListener,
   PersistedSubscription,
   SubscriptionStatus,
+  SyncSubscriptionRequest,
   SyncTransport,
 } from "./types.js";
 import { InMemoryStore } from "./inMemoryStore.js";
@@ -77,19 +78,16 @@ export class SyncClient<T extends SyncRecord> {
 
     // Restore from store if named and no explicit previousSubscriptionId
     if (name && previousSubscriptionId === undefined) {
-      console.log("has name, no previousId");
       storedSub = await this.store.getSubscription(name);
       if (storedSub) {
         previousSubscriptionId = storedSub.subscriptionId;
       }
     } else if (previousSubscriptionId !== undefined) {
-      console.log("has previousId");
       storedSub = await this.store.getSubscriptionById(previousSubscriptionId);
     }
 
     // If filter is unchanged, reuse existing subscription (restores status too)
     if (storedSub && filtersEqual(storedSub.filter, inputFilter)) {
-      console.log("filter is the same!");
       const result: ClientSubscription = {
         ...storedSub,
         ...(name !== undefined && { name }),
@@ -97,41 +95,18 @@ export class SyncClient<T extends SyncRecord> {
       this.activeSubs.set(result.subscriptionId, result);
       return result;
     }
-    console.log("filter has changed", {
-      storedSub,
-      inputFilter,
-    });
 
-    // Create or update via transport
-    const result = await this.transport.createSubscription(
-      inputFilter,
-      previousSubscriptionId,
-    );
-
-    // Clean up old subscription if replacing
-    // if (storedSub) {
-    //   const oldKey = storedSub.name ?? storedSub.subscriptionId;
-    //   await this.store.removeSubscription(oldKey);
-    //   this.activeSubs.delete(storedSub.subscriptionId);
-
-    //   // TODO: also evict any filter changes
-    //   if (result.resetRequired) {
-    //     await this.store.evict(storedSub.filter as SubscriptionFilter<T>);
-    //   }
-    // }
-
-    // Build new sub — status determined below
+    // Generate a client-side UUID — no server call needed
+    const newSubscriptionId = crypto.randomUUID();
     let newSub: PersistedSubscription = {
-      subscriptionId: result.subscriptionId,
-      filter: result.filter,
-      syncToken: result.syncToken,
+      subscriptionId: newSubscriptionId,
+      filter: inputFilter,
+      syncToken: EMPTY_SYNC_TOKEN,
       ...(name !== undefined && { name }),
       status: "active",
     };
 
-    console.log("new sub", newSub);
-
-    const key = name ?? result.subscriptionId;
+    const key = name ?? newSubscriptionId;
 
     // Load all persisted subscriptions from the store (source of truth — activeSubs
     // only reflects the current session). Exclude the old sub being replaced, if any.
@@ -140,21 +115,16 @@ export class SyncClient<T extends SyncRecord> {
       .filter((s) => s.subscriptionId !== storedSub?.subscriptionId)
       .filter((s) => s.syncToken !== EMPTY_SYNC_TOKEN)
       .map((s) => s.filter as SubscriptionFilter<T>);
-    console.log("existingFilters", existingFilters);
 
-    // two things to Check
-    // 1. is our new filter entirely contained in our existing data?
-    // 2. does our old filter contain items that need eviction
-
+    // Check 1: is the new filter entirely covered by existing data?
+    // Check 2: does the old filter contain items that need eviction?
     let newFilterPositive = existingFilters;
     let evictionFilter: SubscriptionFilter<T>[] | undefined;
     if (storedSub) {
-      // need the old filter in too
       newFilterPositive = [
         ...existingFilters,
         storedSub.filter as SubscriptionFilter<T>,
       ];
-      // put new input filter in
       evictionFilter = [
         ...existingFilters,
         inputFilter as SubscriptionFilter<T>,
@@ -168,10 +138,15 @@ export class SyncClient<T extends SyncRecord> {
       await this.checkForEviction(evictionFilter, storedSub.filter);
     }
 
-    newSub = { ...result, ...newSub };
+    // Remove old subscription from store and in-memory map
+    if (storedSub) {
+      const oldKey = storedSub.name ?? storedSub.subscriptionId;
+      await this.store.removeSubscription(oldKey);
+      this.activeSubs.delete(storedSub.subscriptionId);
+    }
 
     await this.store.setSubscription(key, newSub);
-    this.activeSubs.set(result.subscriptionId, newSub);
+    this.activeSubs.set(newSubscriptionId, newSub);
 
     return newSub;
   }
@@ -181,25 +156,17 @@ export class SyncClient<T extends SyncRecord> {
     oldFilter: SubscriptionFilter,
   ) {
     const existingUnion = filterUnion(...existingFilters);
-    console.log("checkForEviction-existingUnion", existingUnion);
     const negatedUnion = negateFilter(existingUnion);
-    console.log("checkForEviction-negatedUnion", negatedUnion);
 
     const rawGap = {
       $and: [oldFilter, negatedUnion],
     } as SubscriptionFilter;
 
     if (isAlwaysFalse(rawGap)) {
-      // nothing needs to be removed
       return;
     }
-    const rawIntersection = {
-      $and: [oldFilter, existingUnion],
-    } as SubscriptionFilter;
-    console.log("checkForEviction-rawIntersection", rawIntersection);
-    // Gap exists — simplify the gap filter for the server (safe to do after always-false check).
+
     const fGap = simplifyFilter(rawGap);
-    console.log("checkForEviction-fGap", fGap);
     await this.store.evict(fGap as SubscriptionFilter<T>);
   }
 
@@ -209,67 +176,52 @@ export class SyncClient<T extends SyncRecord> {
     inputFilter: SubscriptionFilter,
     newSub: PersistedSubscription,
   ): Promise<PersistedSubscription> {
-    // Compute the gap: the part of F_new not covered by any existing subscription.
-    // isAlwaysFalse must see the raw $and structure — simplifyFilter can destroy
-    // contradictions (e.g. collapses { $and:[{x:1},{x:{$ne:1}}] } → {x:1}).
     const existingUnion = filterUnion(...existingFilters);
-    console.log("existingUnion", existingUnion);
     const negatedUnion = negateFilter(existingUnion);
-    console.log("negatedUnion", negatedUnion);
     const rawGap = {
       $and: [inputFilter, negatedUnion],
     } as SubscriptionFilter;
-    console.log("rawGap", rawGap);
 
     if (isAlwaysFalse(rawGap)) {
-      console.log("isAlwaysFalse");
       // F_new is fully covered — every possible record matching F_new is already
       // served by an existing subscription. Reconstruct token from local data.
       const reconstructed = await this.store.reconstructSyncToken(
         inputFilter as SubscriptionFilter<T>,
       );
-      const updated: PersistedSubscription = {
+      return {
         ...newSub,
         status: "active",
         syncToken:
           reconstructed !== EMPTY_SYNC_TOKEN ? reconstructed : newSub.syncToken,
       };
-      return updated;
-      // await this.store.setSubscription(key, updated);
-      // this.activeSubs.set(result.subscriptionId, updated);
-      // return { ...result, ...updated };
     }
-    console.log("isnot always false");
 
-    // Check if fNew and existing subs are completely disjoint (no overlap at all).
-    // In this case there's no local data to reuse — use the server token directly.
+    // Check if F_new and existing subs are completely disjoint (no overlap at all).
+    // In this case there's no local data to reuse — use an empty token directly.
     const rawIntersection = {
       $and: [inputFilter, existingUnion],
     } as SubscriptionFilter;
     if (isAlwaysFalse(rawIntersection)) {
       return newSub;
     }
-    console.log("rawIntersection", rawIntersection);
 
-    // Gap exists — simplify the gap filter for the server (safe to do after always-false check).
+    // Gap exists — simplify the gap filter (safe after always-false check).
     const fGap = simplifyFilter(rawGap);
 
-    console.log("fGap", fGap);
-    const gapResult = await this.transport.createSubscription(fGap);
+    const gapSubId = crypto.randomUUID();
     const gapSub: PersistedSubscription = {
-      subscriptionId: gapResult.subscriptionId,
-      filter: gapResult.filter,
+      subscriptionId: gapSubId,
+      filter: fGap,
       syncToken: EMPTY_SYNC_TOKEN,
-      status: "active", // gap sub itself is always "active" in the pull
+      status: "active",
     };
-    // Store gap sub keyed by its own subscriptionId (unnamed)
-    await this.store.setSubscription(gapResult.subscriptionId, gapSub);
-    const pendingSub: PersistedSubscription = {
+    await this.store.setSubscription(gapSubId, gapSub);
+
+    return {
       ...newSub,
       status: "pending_gap_fill",
-      gapSubscriptionId: gapResult.subscriptionId,
+      gapSubscriptionId: gapSubId,
     };
-    return pendingSub;
   }
 
   /**
@@ -305,21 +257,26 @@ export class SyncClient<T extends SyncRecord> {
    * and transitions to active.
    */
   async pull(): Promise<void> {
-    const subsForPull: { id: string; syncToken: SyncToken }[] = [];
+    const subsForPull: SyncSubscriptionRequest[] = [];
     // Maps gapSubId → parentSubId so we can detect gap completion
     const gapSubToParent = new Map<string, string>();
 
     for (const sub of this.activeSubs.values()) {
       const status = sub.status ?? "active";
       if (status === "active") {
-        subsForPull.push({ id: sub.subscriptionId, syncToken: sub.syncToken });
+        subsForPull.push({
+          key: sub.subscriptionId,
+          filter: sub.filter as SubscriptionFilter,
+          syncToken: sub.syncToken,
+        });
       } else if (status === "pending_gap_fill" && sub.gapSubscriptionId) {
         const gapSub = await this.store.getSubscriptionById(
           sub.gapSubscriptionId,
         );
         if (gapSub) {
           subsForPull.push({
-            id: gapSub.subscriptionId,
+            key: gapSub.subscriptionId,
+            filter: gapSub.filter as SubscriptionFilter,
             syncToken: gapSub.syncToken,
           });
           gapSubToParent.set(gapSub.subscriptionId, sub.subscriptionId);
@@ -339,8 +296,7 @@ export class SyncClient<T extends SyncRecord> {
         // Gap sub received a response — gap is filled.
         const parentSub = this.activeSubs.get(parentSubId)!;
 
-        // Remove gap sub from server (best-effort) and local store
-        await this.transport.deleteSubscription?.(id).catch(() => {});
+        // Remove gap sub from local store only (server is stateless)
         await this.store.removeSubscription(id);
 
         // Reconstruct the parent's sync token from the now-complete local data
@@ -469,7 +425,11 @@ export class SyncClient<T extends SyncRecord> {
     if (subs.length === 0) return () => {};
 
     return this.transport.stream(
-      subs.map((s) => ({ id: s.subscriptionId, syncToken: s.syncToken })),
+      subs.map((s) => ({
+        key: s.subscriptionId,
+        filter: s.filter as SubscriptionFilter,
+        syncToken: s.syncToken,
+      })),
       async ({ patches, syncTokens }) => {
         const applied = await this.store.applyPatches(
           patches as SyncPatch<T>[],

@@ -1,6 +1,14 @@
 # @sync-subscribe/server
 
-Framework-agnostic sync server for `sync-subscribe`. Wire `SyncHandler` into any HTTP framework (Express, Hono, Fastify, …) to expose pull, push, and SSE streaming endpoints for your clients.
+Framework-agnostic sync server for `sync-subscribe`. Wire `SyncHandler` into any HTTP framework (Express, Hono, Fastify, …) to expose pull, push, and SSE streaming endpoints.
+
+## Design
+
+The server is **stateless with respect to subscriptions**. Clients send their filters and sync tokens directly in every pull/stream request — the server never stores subscription state. This means:
+
+- No subscription table in your database
+- No risk of client/server subscription desync
+- The server simply applies its own mandatory filter additions (e.g. `userId`) at request time
 
 ## Concepts
 
@@ -8,10 +16,9 @@ Framework-agnostic sync server for `sync-subscribe`. Wire `SyncHandler` into any
 |---|---|
 | `SyncRecord` | Every synced record must have `recordId`, `createdAt`, `updatedAt`, `revisionCount` |
 | `SyncStore` | Your storage adapter — implement `getRecordsSince`, `upsert`, `getById` |
-| `SubscriptionManager` | Tracks active subscriptions; in-memory by default, pluggable for persistence |
-| `SyncHandler` | Orchestrates pull / push / subscribe logic; decoupled from HTTP |
-| `clientFilter` | Filter the client requested (subset of fields, visible to client) |
-| `serverFilter` | Complete effective filter used for queries: `clientFilter ⊆ serverFilter` |
+| `SyncHandler` | Orchestrates pull / push logic; decoupled from HTTP |
+| `SyncSubscriptionRequest` | One entry in a pull/stream request: `{ key, filter, syncToken }` |
+| Server filter additions | Fields the server merges into every client filter (e.g. `userId`) — invisible to the client |
 
 ## Installation
 
@@ -43,13 +50,12 @@ import { decodeSyncToken } from "@sync-subscribe/core";
 
 class NotesStore implements SyncStore<NoteRecord> {
   async getRecordsSince(
-    filter: SubscriptionFilter,
-    since: SyncToken
+    subscriptions: { filter: SubscriptionFilter; since: SyncToken }[]
   ): Promise<SyncPatch<NoteRecord>[]> {
-    const token = decodeSyncToken(since);
-    // Query your DB: return records matching `filter` updated after `token`.
+    // Query your DB using a union of all subscription filters,
+    // each scoped to its own since-token.
     // Results must be ordered by (updatedAt ASC, revisionCount ASC, recordId ASC).
-    // ...
+    // SyncHandler deduplicates records that match multiple subscriptions.
   }
 
   async upsert(record: NoteRecord): Promise<NoteRecord> {
@@ -66,98 +72,114 @@ class NotesStore implements SyncStore<NoteRecord> {
 ### 3. Wire up routes
 
 ```ts
-import { SubscriptionManager, SyncHandler } from "@sync-subscribe/server";
-import type { UpdateSubscriptionRequest } from "@sync-subscribe/server";
-import type { SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
+import { SyncHandler } from "@sync-subscribe/server";
+import type { SyncSubscriptionRequest } from "@sync-subscribe/server";
+import type { SubscriptionFilter } from "@sync-subscribe/core";
 
 const store = new NotesStore();
-const subscriptions = new SubscriptionManager<NoteRecord>();
-const handler = new SyncHandler(store, subscriptions, {
-  readonlyFields: ["createdAt"],           // clients cannot overwrite these
+const handler = new SyncHandler<NoteRecord>(store, {
+  readonlyFields: ["createdAt"],          // clients cannot overwrite these
   onRecordsChanged: (records) => { /* notify SSE clients */ },
 });
 
-// PUT /subscriptions — create or update a subscription
-app.put("/subscriptions", async (req, res) => {
-  const { filter, previousSubscriptionId } = req.body as {
-    filter: SubscriptionFilter;
-    previousSubscriptionId?: string;
-  };
-  // Merge server-enforced fields (e.g. userId) — invisible to the client.
-  const serverAdditions = { userId: req.user.id };
-  const result = await handler.updateSubscription(filter, serverAdditions, previousSubscriptionId);
-  res.json(result); // { subscriptionId, syncToken, resetRequired }
+// POST /sync/pull — pull patches for all requested subscriptions
+app.post("/sync/pull", async (req, res) => {
+  const { subscriptions } = req.body as { subscriptions: SyncSubscriptionRequest[] };
+
+  // Merge server-enforced fields into each subscription's filter.
+  // The client never sees these additions.
+  const merged = subscriptions.map((s) => ({
+    ...s,
+    filter: { ...s.filter, userId: req.user.id } as SubscriptionFilter,
+  }));
+
+  const result = await handler.pull(merged);
+  res.json(result); // { patches, syncTokens }
 });
 
-// GET /sync?subscriptionId=X&syncToken=Y — pull
-app.get("/sync", async (req, res) => {
-  const { subscriptionId, syncToken } = req.query as Record<string, string>;
-  const result = await handler.pull({ subscriptionId, syncToken: syncToken as SyncToken });
-  res.json(result); // { patches, syncToken }
-});
-
-// POST /sync — push records from client
-app.post("/sync", async (req, res) => {
-  const { subscriptionId, records } = req.body;
-  const result = await handler.push({ subscriptionId, records });
-  res.json(result); // { ok: true } or { conflict: true, serverRecord }
+// POST /sync/push — push records from client
+app.post("/sync/push", async (req, res) => {
+  const { records } = req.body;
+  // Inject server-authoritative fields before processing
+  const sanitized = records.map((r) => ({ ...r, userId: req.user.id }));
+  const result = await handler.push({ records: sanitized });
+  res.json(result); // { ok: true, serverUpdatedAt } or { conflict: true, serverRecord }
 });
 ```
 
 ## SSE streaming
 
-Clients can subscribe to a persistent push stream instead of polling.
+The client opens a persistent SSE stream by POSTing its subscriptions (same shape as pull). The server sends an initial batch, then fans out future changes via `onRecordsChanged`.
 
 ```ts
-// GET /sync/stream?subscriptionId=X&syncToken=Y
-app.get("/sync/stream", async (req, res) => {
-  const { subscriptionId, syncToken } = req.query as Record<string, string>;
+import { matchesFilter, encodeSyncToken } from "@sync-subscribe/core";
+import type { SyncToken, SubscriptionFilter, StreamEvent } from "@sync-subscribe/core";
 
-  const sub = subscriptions.get(subscriptionId);
-  if (!sub) return res.status(400).json({ error: "Unknown subscription" });
+interface SseConnection {
+  subscriptions: { key: string; filter: SubscriptionFilter }[];
+  res: Response;
+}
+const sseConnections = new Set<SseConnection>();
+
+const handler = new SyncHandler<NoteRecord>(store, {
+  onRecordsChanged: (records) => {
+    for (const conn of sseConnections) {
+      const patches = [];
+      const syncTokens: Record<string, SyncToken> = {};
+
+      for (const sub of conn.subscriptions) {
+        const matching = records.filter((r) =>
+          matchesFilter(r as Record<string, unknown>, sub.filter)
+        );
+        if (matching.length === 0) continue;
+
+        const last = matching[matching.length - 1]!;
+        syncTokens[sub.key] = encodeSyncToken({
+          updatedAt: last.updatedAt,
+          revisionCount: last.revisionCount,
+          recordId: last.recordId,
+        });
+        patches.push(...matching.map((r) => ({ op: "upsert" as const, record: r })));
+      }
+
+      if (patches.length > 0) {
+        conn.res.write(`data: ${JSON.stringify({ patches, syncTokens })}\n\n`);
+      }
+    }
+  },
+});
+
+// POST /sync/stream — POST-based SSE (body carries subscriptions)
+app.post("/sync/stream", async (req, res) => {
+  const { subscriptions } = req.body as { subscriptions: SyncSubscriptionRequest[] };
+
+  // Merge server filter additions
+  const merged = subscriptions.map((s) => ({
+    ...s,
+    filter: { ...s.filter, userId: req.user.id } as SubscriptionFilter,
+  }));
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
   // Send initial batch
-  const initial = await handler.pull({ subscriptionId, syncToken: syncToken as SyncToken });
+  const initial = await handler.pull(merged);
   res.write(`data: ${JSON.stringify(initial)}\n\n`);
 
-  // Register for push notifications (your own registry)
-  sseClients.get(subscriptionId)?.add(res);
+  // Register for future push notifications
+  const conn: SseConnection = {
+    subscriptions: merged.map((s) => ({ key: s.key, filter: s.filter })),
+    res,
+  };
+  sseConnections.add(conn);
 
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 30_000);
   req.on("close", () => {
     clearInterval(heartbeat);
-    sseClients.get(subscriptionId)?.delete(res);
+    sseConnections.delete(conn);
   });
-});
-```
-
-Push to registered SSE clients inside `onRecordsChanged`:
-
-```ts
-const handler = new SyncHandler(store, subscriptions, {
-  onRecordsChanged: (records) => {
-    for (const [subId, clients] of sseClients) {
-      const sub = subscriptions.get(subId);
-      if (!sub) continue;
-
-      const matching = records.filter((r) =>
-        matchesFilter(r as Record<string, unknown>, sub.serverFilter)
-      );
-      if (matching.length === 0) continue;
-
-      const patches = matching.map((r) => ({ op: "upsert" as const, record: r }));
-      const lastRecord = matching[matching.length - 1]!;
-      subscriptions.updateSyncToken(subId, lastRecord);
-      const newToken = subscriptions.get(subId)!.syncToken;
-
-      const payload = `data: ${JSON.stringify({ patches, syncToken: newToken })}\n\n`;
-      for (const res of clients) res.write(payload);
-    }
-  },
 });
 ```
 
@@ -166,44 +188,26 @@ const handler = new SyncHandler(store, subscriptions, {
 Use `serverUpsert` for background jobs, webhooks, or inter-service writes. Unlike `push`, there is no conflict resolution — the server's intent always wins.
 
 ```ts
-const stored = await handler.serverUpsert({
+await handler.serverUpsert({
   recordId: "note-abc",
   userId: "system",
   title: "Auto-generated",
   contents: "...",
   isDeleted: false,
-  createdAt: 0,  // overwritten by serverUpsert
-  updatedAt: 0,  // overwritten by serverUpsert
-  revisionCount: 0,  // incremented by serverUpsert
+  createdAt: 0,       // overwritten by serverUpsert
+  updatedAt: 0,       // overwritten by serverUpsert
+  revisionCount: 0,   // incremented by serverUpsert
 });
 ```
 
 `onRecordsChanged` fires after every `serverUpsert`, so SSE clients are notified automatically.
 
-## Persistent subscriptions
-
-By default subscriptions are lost on restart. Provide a `SubscriptionStore` backed by your database to survive restarts.
-
-```ts
-import type { SubscriptionStore, ServerSubscription } from "@sync-subscribe/server";
-
-class DbSubscriptionStore implements SubscriptionStore {
-  async save(sub: ServerSubscription) { /* upsert row */ }
-  async get(id: string) { /* SELECT by id */ }
-  async delete(id: string) { /* DELETE by id */ }
-  async getAll() { /* SELECT * */ }
-}
-
-const subscriptions = new SubscriptionManager(new DbSubscriptionStore());
-await subscriptions.initialize(); // warm in-memory cache on startup
-```
-
 ## Readonly fields
 
-Fields listed in `readonlyFields` are copied from the server record before conflict resolution. Clients cannot overwrite them even if they try.
+Fields listed in `readonlyFields` are copied from the existing server record before conflict resolution. Clients cannot overwrite them even if they try.
 
 ```ts
-new SyncHandler(store, subscriptions, {
+new SyncHandler(store, {
   readonlyFields: ["createdAt", "userId"],
 });
 ```
@@ -216,24 +220,7 @@ On `push`, if the server's `revisionCount` is higher than the incoming record (o
 // { conflict: true, serverRecord: NoteRecord }
 ```
 
-The client should apply the server record locally and retry if needed. The `revisionCount` acts as a "work done" counter — it doesn't depend on clocks.
-
-## Partial sync on filter update
-
-When a subscription filter changes, `updateSubscription` normally resets to `EMPTY_SYNC_TOKEN` (full re-sync). You can avoid this for the common case where the filter only expands by implementing `computePartialSyncToken` on your `SyncStore`:
-
-```ts
-async computePartialSyncToken(
-  oldFilter: SubscriptionFilter,
-  newFilter: SubscriptionFilter,
-  existingToken: SyncToken
-): Promise<SyncToken> {
-  // Find the oldest record newly in scope (in newFilter but not oldFilter).
-  // Return a token positioned just before it so the client only pulls the delta.
-  // Return existingToken if the filter only narrowed (no new records to send).
-  // Return EMPTY_SYNC_TOKEN to fall back to a full re-sync.
-}
-```
+The client should apply the server record locally and retry if needed. `revisionCount` acts as a "work done" counter — it doesn't depend on clocks.
 
 ## API reference
 
@@ -241,18 +228,22 @@ async computePartialSyncToken(
 
 | Method | Description |
 |---|---|
-| `updateSubscription(clientFilter, serverAdditions?, previousId?)` | Create or update a subscription. Returns `{ subscriptionId, syncToken, resetRequired }` |
-| `pull(req)` | Return patches since `syncToken` for a subscription |
+| `pull(subscriptions)` | Return deduplicated patches and per-key `syncTokens` for all requested subscriptions |
 | `push(req)` | Accept client records, resolve conflicts, persist, fire `onRecordsChanged` |
-| `serverUpsert(record)` | Write a record as the server; no conflict resolution |
+| `serverUpsert(record)` | Write a record as the server; no conflict resolution; fires `onRecordsChanged` |
 
-### `SubscriptionManager<T>`
+### `SyncHandlerOptions<T>`
+
+| Option | Description |
+|---|---|
+| `readonlyFields` | Fields clients cannot modify |
+| `onRecordsChanged` | Called after every successful `push` or `serverUpsert` with the stored records |
+
+### `SyncStore<T>`
 
 | Method | Description |
 |---|---|
-| `create(clientFilter, serverAdditions?)` | Create a new subscription |
-| `update(previousId, clientFilter, serverAdditions?)` | Replace an existing subscription |
-| `get(subscriptionId)` | Synchronous cache lookup |
-| `updateSyncToken(subscriptionId, lastRecord)` | Advance the sync token after sending records |
-| `setToken(subscriptionId, token)` | Set a raw token (used with `computePartialSyncToken`) |
-| `initialize()` | Warm cache from a persistent `SubscriptionStore` |
+| `getRecordsSince(subscriptions)` | Fetch records matching a union of `{ filter, since }` entries; ordered by `(updatedAt, revisionCount, recordId) ASC` |
+| `upsert(record)` | Write a record; return the stored record |
+| `getById(recordId)` | Return the current record for a given id, or `null` |
+| `computePartialSyncToken?(oldFilter, newFilter, token)` | Optional: compute a smarter token when a subscription filter changes |

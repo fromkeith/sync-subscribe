@@ -13,14 +13,16 @@ export interface ClientSubscriptionOptions {
   filter: SubscriptionFilter;
   /** Stable client-side name for this subscription. Used to persist and restore state across sessions. */
   name?: string;
-  /** If provided, replaces an existing subscription on the server. */
+  /**
+   * If provided, the new subscription replaces the existing one with this ID.
+   * Used locally only — no server call is made. Triggers gap/eviction analysis.
+   */
   previousSubscriptionId?: string;
 }
 
 export interface ClientSubscription extends Subscription {
   /** Stable client-side name, if one was given when subscribing. */
   name?: string;
-  resetRequired?: boolean;
   status?: SubscriptionStatus;
   gapSubscriptionId?: string;
 }
@@ -41,18 +43,20 @@ export interface PersistedSubscription extends Subscription {
   gapSubscriptionId?: string;
 }
 
+/** One entry sent in a pull or stream request. key is echoed back in syncTokens responses. */
+export interface SyncSubscriptionRequest {
+  key: string;
+  filter: SubscriptionFilter;
+  syncToken: SyncToken;
+}
+
 /** Minimal HTTP transport interface — swap in fetch, axios, etc. */
 export interface SyncTransport {
-  createSubscription(
-    filter: SubscriptionFilter,
-    previousSubscriptionId?: string,
-  ): Promise<ClientSubscription>;
-
   /**
    * Pull patches for all active subscriptions in a single request.
-   * Returns deduplicated patches and one sync token per affected subscription.
+   * Returns deduplicated patches and one sync token per affected subscription key.
    */
-  pull(subscriptions: { id: string; syncToken: SyncToken }[]): Promise<{
+  pull(subscriptions: SyncSubscriptionRequest[]): Promise<{
     patches: SyncPatch<SyncRecord>[];
     syncTokens: Record<string, SyncToken>;
   }>;
@@ -69,17 +73,11 @@ export interface SyncTransport {
   >;
 
   /**
-   * Remove a subscription from the server. Used to clean up gap subscriptions
-   * once they have been fully filled.
-   */
-  deleteSubscription?(subscriptionId: string): Promise<void>;
-
-  /**
    * Optional POST-based SSE streaming for all active subscriptions.
    * Returns a cleanup function that closes the connection.
    */
   stream?(
-    subscriptions: { id: string; syncToken: SyncToken }[],
+    subscriptions: SyncSubscriptionRequest[],
     onMessage: (event: StreamEvent) => void,
     onError?: (err: Error) => void,
   ): () => void;

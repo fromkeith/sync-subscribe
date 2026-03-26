@@ -6,16 +6,6 @@ export function openDb(path = "notes.db"): Database.Database {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.exec(`
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      subscriptionId TEXT PRIMARY KEY,
-      clientFilter   TEXT NOT NULL,
-      serverFilter   TEXT NOT NULL,
-      filter         TEXT NOT NULL,
-      syncToken      TEXT NOT NULL DEFAULT ''
-    );
-  `);
-
-  db.exec(`
     CREATE TABLE IF NOT EXISTS notes (
       recordId        TEXT PRIMARY KEY,
       userId          TEXT NOT NULL,

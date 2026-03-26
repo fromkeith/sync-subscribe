@@ -1,7 +1,6 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { EMPTY_SYNC_TOKEN, encodeSyncToken } from "@sync-subscribe/core";
+import { EMPTY_SYNC_TOKEN, encodeSyncToken, matchesFilter } from "@sync-subscribe/core";
 import type { SyncPatch, SyncRecord, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
-import { SubscriptionManager } from "../subscriptionManager.js";
 import { SyncHandler } from "../syncHandler.js";
 import type { SyncStore } from "../types.js";
 
@@ -26,10 +25,11 @@ class InMemoryStore implements SyncStore<TestRecord> {
   computePartialSyncToken?: SyncStore<TestRecord>["computePartialSyncToken"];
 
   async getRecordsSince(
-    _filter: SubscriptionFilter,
-    _since: SyncToken
+    subscriptions: { filter: SubscriptionFilter; since: SyncToken }[],
   ): Promise<SyncPatch<TestRecord>[]> {
-    return [...this.records.values()].map((r) => ({ op: "upsert", record: r }));
+    return [...this.records.values()]
+      .filter((r) => subscriptions.some((s) => matchesFilter(r as Record<string, unknown>, s.filter)))
+      .map((r) => ({ op: "upsert", record: r }));
   }
 
   async upsert(record: TestRecord): Promise<TestRecord> {
@@ -44,49 +44,68 @@ class InMemoryStore implements SyncStore<TestRecord> {
 
 describe("SyncHandler", () => {
   let store: InMemoryStore;
-  let manager: SubscriptionManager<TestRecord>;
   let handler: SyncHandler<TestRecord>;
 
   beforeEach(() => {
     store = new InMemoryStore();
-    manager = new SubscriptionManager();
-    handler = new SyncHandler(store, manager);
+    handler = new SyncHandler(store);
     vi.useRealTimers();
   });
 
   describe("pull", () => {
-    it("returns patches and a new syncToken", async () => {
-      const sub = await manager.create({ name: "hello" });
+    it("returns patches and a new syncToken per key", async () => {
       store.records.set("r1", makeRecord());
 
-      const result = await handler.pull({
-        subscriptionId: sub.subscriptionId,
-        syncToken: EMPTY_SYNC_TOKEN,
-      });
+      const result = await handler.pull([
+        { key: "sub-1", filter: { name: "hello" }, syncToken: EMPTY_SYNC_TOKEN },
+      ]);
 
       expect(result.patches).toHaveLength(1);
       expect(result.patches[0]).toMatchObject({ op: "upsert" });
-      expect(result.syncToken).not.toBe(EMPTY_SYNC_TOKEN);
+      expect(result.syncTokens["sub-1"]).not.toBe(EMPTY_SYNC_TOKEN);
     });
 
-    it("throws for unknown subscription", async () => {
-      await expect(
-        handler.pull({ subscriptionId: "unknown", syncToken: EMPTY_SYNC_TOKEN })
-      ).rejects.toThrow("Unknown subscription");
+    it("returns unchanged syncToken when no records match the filter", async () => {
+      store.records.set("r1", makeRecord({ name: "world" }));
+      const token = encodeSyncToken({ updatedAt: 500, revisionCount: 1, recordId: "r0" });
+
+      const result = await handler.pull([
+        { key: "sub-1", filter: { name: "hello" }, syncToken: token },
+      ]);
+
+      expect(result.patches).toHaveLength(0);
+      expect(result.syncTokens["sub-1"]).toBe(token);
+    });
+
+    it("deduplicates patches across multiple subscriptions", async () => {
+      store.records.set("r1", makeRecord());
+
+      const result = await handler.pull([
+        { key: "sub-1", filter: { name: "hello" }, syncToken: EMPTY_SYNC_TOKEN },
+        { key: "sub-2", filter: { name: "hello" }, syncToken: EMPTY_SYNC_TOKEN },
+      ]);
+
+      expect(result.patches).toHaveLength(1);
+      expect(result.syncTokens["sub-1"]).toBeDefined();
+      expect(result.syncTokens["sub-2"]).toBeDefined();
+    });
+
+    it("returns a key in syncTokens for every subscription in the request", async () => {
+      const result = await handler.pull([
+        { key: "a", filter: {}, syncToken: EMPTY_SYNC_TOKEN },
+        { key: "b", filter: {}, syncToken: EMPTY_SYNC_TOKEN },
+      ]);
+
+      expect(Object.keys(result.syncTokens)).toEqual(["a", "b"]);
     });
   });
 
   describe("push", () => {
     it("stores a record with server-stamped updatedAt", async () => {
-      const sub = await manager.create({});
       const before = Date.now();
-
-      const result = await handler.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord()],
-      });
-
+      const result = await handler.push({ records: [makeRecord()] });
       const after = Date.now();
+
       expect(result).toEqual({ ok: true });
       const stored = store.records.get("r1");
       expect(stored).toMatchObject({ recordId: "r1", name: "hello", revisionCount: 1 });
@@ -95,137 +114,58 @@ describe("SyncHandler", () => {
     });
 
     it("stamps createdAt with server time for new records", async () => {
-      const sub = await manager.create({});
       const before = Date.now();
-
-      await handler.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord({ createdAt: 1 })], // client sends old createdAt
-      });
-
+      await handler.push({ records: [makeRecord({ createdAt: 1 })] });
       const after = Date.now();
+
       const stored = store.records.get("r1");
       expect(stored?.createdAt).toBeGreaterThanOrEqual(before);
       expect(stored?.createdAt).toBeLessThanOrEqual(after);
     });
 
-    it("preserves createdAt on existing records (not overridden)", async () => {
-      const sub = await manager.create({});
-      const original = makeRecord({ createdAt: 999 });
-      store.records.set("r1", original);
+    it("preserves createdAt on existing records", async () => {
+      store.records.set("r1", makeRecord({ createdAt: 999 }));
+      await handler.push({ records: [makeRecord({ revisionCount: 5, createdAt: 1 })] });
 
-      await handler.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord({ revisionCount: 5, createdAt: 1 })],
-      });
-
-      // createdAt should remain the original server value since record already exists
-      const stored = store.records.get("r1");
-      expect(stored?.createdAt).toBe(999);
+      expect(store.records.get("r1")?.createdAt).toBe(999);
     });
 
     it("returns conflict when server record has higher revisionCount", async () => {
-      const sub = await manager.create({});
       const serverRecord = makeRecord({ revisionCount: 10 });
       store.records.set("r1", serverRecord);
 
-      const result = await handler.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord({ revisionCount: 1 })],
-      });
+      const result = await handler.push({ records: [makeRecord({ revisionCount: 1 })] });
 
       expect(result).toMatchObject({ conflict: true, serverRecord });
     });
 
-    it("enforces readonlyFields — client cannot change them on existing records", async () => {
-      const h = new SyncHandler(store, manager, { readonlyFields: ["ownerId"] });
-      const sub = await manager.create({});
-
-      // Establish original record with ownerId = "server-owner"
+    it("enforces readonlyFields", async () => {
+      const h = new SyncHandler(store, { readonlyFields: ["ownerId"] });
       store.records.set("r1", makeRecord({ ownerId: "server-owner" }));
 
-      // Client tries to change ownerId
-      await h.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord({ revisionCount: 5, ownerId: "hacker" })],
-      });
+      await h.push({ records: [makeRecord({ revisionCount: 5, ownerId: "hacker" })] });
 
       expect(store.records.get("r1")?.ownerId).toBe("server-owner");
     });
 
     it("calls onRecordsChanged with stored records", async () => {
       const changed = vi.fn();
-      const h = new SyncHandler(store, manager, { onRecordsChanged: changed });
-      const sub = await manager.create({});
+      const h = new SyncHandler(store, { onRecordsChanged: changed });
 
-      await h.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord()],
-      });
+      await h.push({ records: [makeRecord()] });
 
       expect(changed).toHaveBeenCalledOnce();
-      expect(changed.mock.calls[0]![0]).toHaveLength(1);
       expect(changed.mock.calls[0]![0][0]).toMatchObject({ recordId: "r1" });
     });
 
     it("does not call onRecordsChanged on conflict", async () => {
       const changed = vi.fn();
-      const h = new SyncHandler(store, manager, { onRecordsChanged: changed });
-      const sub = await manager.create({});
+      const h = new SyncHandler(store, { onRecordsChanged: changed });
       store.records.set("r1", makeRecord({ revisionCount: 99 }));
 
-      await h.push({
-        subscriptionId: sub.subscriptionId,
-        records: [makeRecord({ revisionCount: 1 })],
-      });
+      await h.push({ records: [makeRecord({ revisionCount: 1 })] });
 
       expect(changed).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("updateSubscription", () => {
-    it("creates a new subscription when no previousId is given", async () => {
-      const result = await handler.updateSubscription({ name: "hello" });
-      expect(result.resetRequired).toBe(false);
-      expect(result.syncToken).toBe(EMPTY_SYNC_TOKEN);
-      expect(result.subscriptionId).toBeTruthy();
-    });
-
-    it("updates existing subscription, no reset when filter unchanged", async () => {
-      const { subscriptionId } = await handler.updateSubscription({ name: "hello" });
-      const result = await handler.updateSubscription({ name: "hello" }, {}, subscriptionId);
-      expect(result.resetRequired).toBe(false);
-    });
-
-    it("resets to EMPTY_SYNC_TOKEN when filter changes and store has no computePartialSyncToken", async () => {
-      const { subscriptionId } = await handler.updateSubscription({ name: "hello" });
-      // Advance the token so we can check it gets reset
-      manager.updateSyncToken(subscriptionId, makeRecord());
-
-      const result = await handler.updateSubscription({ name: "world" }, {}, subscriptionId);
-      expect(result.resetRequired).toBe(true);
-      expect(result.syncToken).toBe(EMPTY_SYNC_TOKEN);
-    });
-
-    it("uses partial token from store when filter changes and computePartialSyncToken is implemented", async () => {
-      const partialToken = encodeSyncToken({ updatedAt: 500, revisionCount: 0, recordId: "" });
-      store.computePartialSyncToken = vi.fn().mockResolvedValue(partialToken);
-
-      const { subscriptionId } = await handler.updateSubscription({ name: "hello" });
-      manager.updateSyncToken(subscriptionId, makeRecord({ updatedAt: 1000 }));
-
-      const result = await handler.updateSubscription({ name: "world" }, {}, subscriptionId);
-      expect(result.resetRequired).toBe(true); // eviction still required
-      expect(result.syncToken).toBe(partialToken); // but smarter starting point
-      expect(store.computePartialSyncToken).toHaveBeenCalledOnce();
-    });
-
-    it("falls back to full reset when computePartialSyncToken returns EMPTY", async () => {
-      store.computePartialSyncToken = vi.fn().mockResolvedValue(EMPTY_SYNC_TOKEN);
-
-      const { subscriptionId } = await handler.updateSubscription({ name: "hello" });
-      const result = await handler.updateSubscription({ name: "world" }, {}, subscriptionId);
-      expect(result.syncToken).toBe(EMPTY_SYNC_TOKEN);
     });
   });
 
@@ -254,7 +194,7 @@ describe("SyncHandler", () => {
     });
 
     it("enforces readonlyFields", async () => {
-      const h = new SyncHandler(store, manager, { readonlyFields: ["ownerId"] });
+      const h = new SyncHandler(store, { readonlyFields: ["ownerId"] });
       store.records.set("r1", makeRecord({ ownerId: "original" }));
 
       const stored = await h.serverUpsert(makeRecord({ ownerId: "tampered", revisionCount: 5 }));
@@ -263,7 +203,7 @@ describe("SyncHandler", () => {
 
     it("calls onRecordsChanged", async () => {
       const changed = vi.fn();
-      const h = new SyncHandler(store, manager, { onRecordsChanged: changed });
+      const h = new SyncHandler(store, { onRecordsChanged: changed });
 
       await h.serverUpsert(makeRecord());
 

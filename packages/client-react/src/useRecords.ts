@@ -16,13 +16,13 @@ export interface UseRecordsOptions<T extends SyncRecord = SyncRecord> {
 /**
  * Subscribe to a filtered view of synced records.
  *
- * On mount the hook registers a subscription with the server, performs an
- * initial pull, and returns the matching records from the local store. It
- * re-renders whenever the local store changes (patches applied or mutations
- * written) and polls the server on the given interval.
+ * On mount the hook registers a subscription locally, performs an initial
+ * pull, and returns the matching records from the local store. It re-renders
+ * whenever the local store changes (patches applied or mutations written) and
+ * polls the server on the given interval.
  *
  * When `filter` changes the old subscription is replaced with a new one
- * via `previousSubscriptionId` so the server can compute a minimal diff.
+ * locally; gap/eviction analysis runs automatically.
  *
  * Records are filtered client-side using `matchesFilter` from @sync-subscribe/core,
  * which correctly handles overlapping subscriptions stored in the same LocalStore.

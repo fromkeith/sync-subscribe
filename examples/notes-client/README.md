@@ -32,11 +32,11 @@ The Vite dev server proxies `/api` to `http://localhost:3001`, so no CORS config
 
 ### Server-side user isolation
 
-The transport sends `X-User-Id: user-123` on every request (see `src/transport.ts`). The server injects this as a mandatory `userId` clause on every subscription filter, so a client can never construct a filter that returns another user's notes. In the real world you would not do auth this way. But it demonstrates how the server can add its own filtering.
+The transport sends `X-User-Id: user-123` on every request (see `src/transport.ts`). The server merges `{ userId }` into every subscription filter at request time — the client never sees this addition and cannot bypass it. In a real app you would derive `userId` from a verified auth token.
 
 ### Subscription-driven sync
 
-The client maintains two named server subscriptions:
+The client maintains two named subscriptions:
 
 | Name | Filter |
 |---|---|
@@ -47,16 +47,15 @@ Both share a single `IdbLocalStore` — overlapping records are stored once and 
 
 ### Dynamic time range (Recent tab)
 
-Selecting a time range on the **Recent** tab issues an `updateSubscription` call with `previousSubscriptionId`, so the server computes a minimal diff rather than re-sending all matching records. The gap analysis in `SyncClient` determines whether any locally-cached data already satisfies the new filter.
+Selecting a time range on the **Recent** tab calls `updateSubscription` with the new filter. The client runs gap and eviction analysis locally: it determines whether any records matching the new filter are not yet cached, fetches only what's missing, and evicts records that only the old filter needed.
 
 ### Real-time streaming
 
-After the initial pull, the client opens a single SSE connection. Any push from any client triggers an `onRecordsChanged` callback on the server, which fans out the changed records to every open SSE connection whose subscription filter matches.
+After the initial pull, the client opens a single SSE connection (via `POST /api/sync/stream`), sending its subscription filters and sync tokens in the request body. Any push from any client triggers the `onRecordsChanged` callback on the server, which fans out the changed records to every open SSE connection whose filters match.
 
 ### Optimistic mutations
 
 `mutate()` writes the record to IndexedDB and emits a patch event immediately (so the UI updates without waiting for the server), then pushes to the server in the background. On conflict, the server version wins and the local copy is corrected.
-
 
 ## Database
 

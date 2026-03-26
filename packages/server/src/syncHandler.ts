@@ -1,102 +1,82 @@
 import {
   resolveConflict,
   matchesFilter,
+  encodeSyncToken,
   EMPTY_SYNC_TOKEN,
 } from "@sync-subscribe/core";
 import type {
   SyncRecord,
   SyncToken,
-  SubscriptionFilter,
   SyncPatch,
   ConflictResult,
 } from "@sync-subscribe/core";
 import type {
-  CreateSubscriptionResponse,
   SyncHandlerOptions,
   SyncStore,
+  SyncSubscriptionRequest,
 } from "./types.js";
-import type { SubscriptionManager } from "./subscriptionManager.js";
 
 /**
  * Core sync logic, decoupled from any HTTP framework.
  * Wire this up to your route handlers (Express, Hono, Fastify, …).
+ *
+ * The server has no concept of stored subscriptions. The client sends its
+ * filters and sync tokens directly in every pull/stream request. The route
+ * handler is responsible for merging any server-side filter additions
+ * (e.g. userId from auth context) before calling pull().
  */
 export class SyncHandler<T extends SyncRecord> {
   constructor(
     private readonly store: SyncStore<T>,
-    private readonly subscriptions: SubscriptionManager<T>,
     private readonly options: SyncHandlerOptions<T> = {},
   ) {}
 
   /**
-   * Creates or updates a subscription, applying a partial sync token when possible.
+   * Pull patches for one or more subscriptions.
+   *
+   * Each entry in `subscriptions` carries an opaque `key` (echoed back in
+   * the response), a fully-merged filter (client filter + server additions),
+   * and the client's last-known sync token.
+   *
+   * Returns deduplicated patches and one sync token per key.
    */
-  async updateSubscription(
-    clientFilter: SubscriptionFilter,
-    serverAdditions: SubscriptionFilter = {},
-    previousSubscriptionId?: string,
-  ): Promise<CreateSubscriptionResponse> {
-    if (!previousSubscriptionId) {
-      const sub = await this.subscriptions.create(clientFilter, serverAdditions);
-      return { subscriptionId: sub.subscriptionId, filter: clientFilter, syncToken: sub.syncToken, resetRequired: false };
-    }
-
-    const old = await this.subscriptions.get(previousSubscriptionId);
-    const { subscription, resetRequired } = await this.subscriptions.update(
-      previousSubscriptionId,
-      clientFilter,
-      serverAdditions,
+  async pull(subscriptions: SyncSubscriptionRequest[]): Promise<{
+    patches: SyncPatch<T>[];
+    syncTokens: Record<string, SyncToken>;
+  }> {
+    const allPatches = await this.store.getRecordsSince(
+      subscriptions.map((s) => ({ filter: s.filter, since: s.syncToken })),
     );
 
-    if (resetRequired && old && this.store.computePartialSyncToken) {
-      const partialToken = await this.store.computePartialSyncToken(
-        old.serverFilter,
-        subscription.serverFilter,
-        old.syncToken,
-      );
-      if (partialToken !== EMPTY_SYNC_TOKEN) {
-        this.subscriptions.setToken(subscription.subscriptionId, partialToken);
-        return {
-          subscriptionId: subscription.subscriptionId,
-          filter: clientFilter,
-          syncToken: partialToken,
-          resetRequired: true,
-        };
+    // Compute the latest sync token per subscription key.
+    const syncTokens: Record<string, SyncToken> = {};
+    for (const sub of subscriptions) {
+      let lastMatch: T | undefined;
+      for (const p of allPatches) {
+        if (
+          p.op === "upsert" &&
+          matchesFilter(p.record as Record<string, unknown>, sub.filter)
+        ) {
+          lastMatch = p.record as T;
+        }
       }
+      syncTokens[sub.key] = lastMatch
+        ? encodeSyncToken({
+            updatedAt: lastMatch.updatedAt,
+            revisionCount: lastMatch.revisionCount,
+            recordId: lastMatch.recordId,
+          })
+        : sub.syncToken;
     }
 
-    return {
-      subscriptionId: subscription.subscriptionId,
-      filter: clientFilter,
-      syncToken: subscription.syncToken,
-      resetRequired,
-    };
-  }
+    // Deduplicate patches — last write per recordId wins across subscriptions.
+    const patchMap = new Map<string, SyncPatch<T>>();
+    for (const p of allPatches) {
+      const k = p.op === "upsert" ? p.record.recordId : p.recordId;
+      patchMap.set(k, p);
+    }
 
-  async pull(req: {
-    subscriptionId: string;
-    syncToken: SyncToken;
-  }): Promise<{ patches: SyncPatch<T>[]; syncToken: SyncToken }> {
-    const sub = await this.subscriptions.get(req.subscriptionId);
-    if (!sub) throw new Error(`Unknown subscription: ${req.subscriptionId}`);
-
-    const patches = await this.store.getRecordsSince([
-      { filter: sub.serverFilter, since: req.syncToken },
-    ]);
-
-    const lastMatch = [...patches]
-      .reverse()
-      .find(
-        (p) =>
-          p.op === "upsert" &&
-          matchesFilter(p.record as Record<string, unknown>, sub.serverFilter),
-      );
-
-    const syncToken = lastMatch && lastMatch.op === "upsert"
-      ? this.subscriptions.updateSyncToken(req.subscriptionId, lastMatch.record)
-      : sub.syncToken;
-
-    return { patches, syncToken };
+    return { patches: [...patchMap.values()], syncTokens };
   }
 
   async push(req: { records: T[] }): Promise<{ ok: true } | ConflictResult<T>> {
@@ -107,7 +87,6 @@ export class SyncHandler<T extends SyncRecord> {
     for (const incoming of req.records) {
       const existing = await this.store.getById(incoming.recordId);
 
-      // Apply readonly field protection
       let record = incoming;
       if (readonlyFields && readonlyFields.length > 0 && existing) {
         const patched = { ...record } as Record<string, unknown>;
@@ -117,7 +96,6 @@ export class SyncHandler<T extends SyncRecord> {
         record = patched as T;
       }
 
-      // Conflict resolution: server wins on higher revisionCount or older updatedAt tie.
       if (existing) {
         const winner = resolveConflict(record, existing);
         if (winner === "b") {
@@ -145,7 +123,6 @@ export class SyncHandler<T extends SyncRecord> {
   /**
    * Upserts a record from the server itself (background job, webhook, etc.).
    * The server's intent always wins — no conflict resolution.
-   * Returns the stored record.
    */
   async serverUpsert(record: T): Promise<T> {
     const { readonlyFields, onRecordsChanged } = this.options;

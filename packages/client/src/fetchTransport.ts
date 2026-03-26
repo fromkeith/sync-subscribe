@@ -1,5 +1,5 @@
-import type { SyncRecord, SyncPatch, SyncToken, SubscriptionFilter, StreamEvent } from "@sync-subscribe/core";
-import type { SyncTransport, ClientSubscription } from "./types.js";
+import type { SyncRecord, SyncPatch, SyncToken, StreamEvent } from "@sync-subscribe/core";
+import type { SyncTransport, SyncSubscriptionRequest } from "./types.js";
 
 export interface FetchTransportOptions {
   /** Base URL of the sync server, e.g. "/api" or "https://api.example.com". */
@@ -15,10 +15,9 @@ export interface FetchTransportOptions {
  * A fetch-based SyncTransport that works in any modern browser.
  *
  * Endpoints:
- *   - createSubscription  →  PUT  {baseUrl}/subscriptions
- *   - pull               →  POST {baseUrl}/sync/pull
- *   - push               →  POST {baseUrl}/sync/push
- *   - stream             →  POST {baseUrl}/sync/stream  (fetch-based SSE)
+ *   - pull   →  POST {baseUrl}/sync/pull
+ *   - push   →  POST {baseUrl}/sync/push
+ *   - stream →  POST {baseUrl}/sync/stream  (fetch-based SSE)
  *
  * @example
  * const transport = createFetchTransport({
@@ -35,29 +34,7 @@ export function createFetchTransport(options: FetchTransportOptions): SyncTransp
   }
 
   return {
-    async createSubscription(filter: SubscriptionFilter, previousSubscriptionId?: string): Promise<ClientSubscription> {
-      const body: Record<string, unknown> = { filter };
-      if (previousSubscriptionId !== undefined) {
-        body["previousSubscriptionId"] = previousSubscriptionId;
-      }
-      const res = await fetch(`${baseUrl}/subscriptions`, {
-        method: "PUT",
-        headers: jsonHeaders(),
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`Subscription failed: ${res.status}`);
-      return res.json();
-    },
-
-    async deleteSubscription(subscriptionId: string): Promise<void> {
-      const res = await fetch(`${baseUrl}/subscriptions/${subscriptionId}`, {
-        method: "DELETE",
-        headers: headers(),
-      });
-      if (!res.ok) throw new Error(`Delete subscription failed: ${res.status}`);
-    },
-
-    async pull(subscriptions: { id: string; syncToken: SyncToken }[]): Promise<{ patches: SyncPatch<SyncRecord>[]; syncTokens: Record<string, SyncToken> }> {
+    async pull(subscriptions: SyncSubscriptionRequest[]): Promise<{ patches: SyncPatch<SyncRecord>[]; syncTokens: Record<string, SyncToken> }> {
       const res = await fetch(`${baseUrl}/sync/pull`, {
         method: "POST",
         headers: jsonHeaders(),
@@ -78,7 +55,7 @@ export function createFetchTransport(options: FetchTransportOptions): SyncTransp
     },
 
     stream(
-      subscriptions: { id: string; syncToken: SyncToken }[],
+      subscriptions: SyncSubscriptionRequest[],
       onMessage: (event: StreamEvent) => void,
       onError?: (err: Error) => void,
     ): () => void {

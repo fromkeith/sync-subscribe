@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { EMPTY_SYNC_TOKEN, encodeSyncToken } from "@sync-subscribe/core";
 import type { SyncRecord, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
 import { SyncClient } from "../syncClient.js";
-import type { SyncTransport } from "../types.js";
+import type { SyncTransport, SyncSubscriptionRequest } from "../types.js";
 
 interface TestRecord extends SyncRecord {
   name: string;
@@ -10,15 +10,9 @@ interface TestRecord extends SyncRecord {
 
 function makeTransport(): SyncTransport {
   return {
-    createSubscription: vi.fn(async (filter: SubscriptionFilter) => ({
-      subscriptionId: "sub-1",
-      filter,
-      syncToken: EMPTY_SYNC_TOKEN,
-      resetRequired: false,
-    })),
-    pull: vi.fn(async (subscriptions: { id: string; syncToken: SyncToken }[]) => ({
+    pull: vi.fn(async (subscriptions: SyncSubscriptionRequest[]) => ({
       patches: [],
-      syncTokens: Object.fromEntries(subscriptions.map((s) => [s.id, EMPTY_SYNC_TOKEN])),
+      syncTokens: Object.fromEntries(subscriptions.map((s) => [s.key, EMPTY_SYNC_TOKEN])),
     })),
     push: vi.fn(async () => ({ ok: true as const, serverUpdatedAt: 1000 })),
   };
@@ -45,32 +39,33 @@ beforeEach(() => {
 
 describe("SyncClient", () => {
 
-  it("subscribe calls transport and stores the subscription", async () => {
+  it("subscribe generates a client UUID and stores the subscription without a server call", async () => {
     const sub = await client.subscribe({ filter: { name: "hello" } });
-    expect(sub.subscriptionId).toBe("sub-1");
-    expect(transport.createSubscription).toHaveBeenCalledWith(
-      { name: "hello" },
-      undefined,
-    );
+    expect(sub.subscriptionId).toMatch(/^[0-9a-f-]{36}$/); // UUID format
+    expect(sub.filter).toMatchObject({ name: "hello" });
+    expect(sub.syncToken).toBe(EMPTY_SYNC_TOKEN);
   });
 
-  it("pull calls transport with all subscriptions and applies patches to local store", async () => {
-    await client.subscribe({ filter: {} });
+  it("pull calls transport with key+filter+syncToken and applies patches to local store", async () => {
+    const sub = await client.subscribe({ filter: {} });
     const token = encodeSyncToken({ updatedAt: 2000, revisionCount: 1, recordId: "r1" });
     vi.mocked(transport.pull).mockResolvedValueOnce({
       patches: [{ op: "upsert", record: rec() }],
-      syncTokens: { "sub-1": token },
+      syncTokens: { [sub.subscriptionId]: token },
     });
 
     await client.pull();
     expect(await client.store.getById("r1")).toMatchObject({ name: "hello" });
+
+    const pullArg = vi.mocked(transport.pull).mock.calls[0]![0];
+    expect(pullArg[0]).toMatchObject({ key: sub.subscriptionId, filter: {} });
   });
 
   it("pull emits patch listener", async () => {
-    await client.subscribe({ filter: {} });
+    const sub = await client.subscribe({ filter: {} });
     vi.mocked(transport.pull).mockResolvedValueOnce({
       patches: [{ op: "upsert", record: rec() }],
-      syncTokens: { "sub-1": EMPTY_SYNC_TOKEN },
+      syncTokens: { [sub.subscriptionId]: EMPTY_SYNC_TOKEN },
     });
 
     const patches = await new Promise((resolve) => {
@@ -103,58 +98,56 @@ describe("SyncClient", () => {
   });
 
   it("reset clears subscriptions and store", async () => {
-    await client.subscribe({ filter: {} });
+    const sub = await client.subscribe({ filter: {} });
     await client.mutate(rec());
     await client.reset();
-    expect(client.getSubscription("sub-1")).toBeUndefined();
+    expect(client.getSubscription(sub.subscriptionId)).toBeUndefined();
     expect(await client.store.getAll()).toHaveLength(0);
   });
 });
 
-describe("updateSubscription / resetRequired eviction", () => {
-  it("evicts records from old filter when resetRequired is true", async () => {
-    // First subscription: color=blue
-    vi.mocked(transport.createSubscription).mockResolvedValueOnce({
-      subscriptionId: "sub-1",
-      filter: { color: "blue" },
-      syncToken: EMPTY_SYNC_TOKEN,
-      resetRequired: false,
+describe("updateSubscription / eviction", () => {
+  it("updateSubscription returns a new sub with the updated filter", async () => {
+    const sub1 = await client.subscribe({ filter: { color: "blue" } });
+
+    const updated = await client.updateSubscription(sub1.subscriptionId, { color: "red" });
+
+    expect(updated.filter).toMatchObject({ color: "red" });
+    expect(updated.subscriptionId).not.toBe(sub1.subscriptionId); // new UUID
+  });
+
+  it("evicts records from old filter not covered by remaining subscriptions", async () => {
+    const sub1 = await client.subscribe({ filter: { color: "blue" } });
+
+    // Manually advance token so this sub participates as a "coverage" source
+    await client.store.setSubscription(sub1.subscriptionId, {
+      ...sub1,
+      syncToken: encodeSyncToken({ updatedAt: 1, revisionCount: 1, recordId: "x" }),
     });
-    await client.subscribe({ filter: { color: "blue" } });
 
-    // Populate store with a blue record
-    await client.store.write(rec({ recordId: "blue-1", name: "blue note" }));
+    await client.store.write({ recordId: "blue-1", name: "blue note", color: "blue", createdAt: 0, updatedAt: 0, revisionCount: 1 } as unknown as TestRecord);
 
-    // Update subscription — server returns same ID (it's an update, not a new sub)
-    vi.mocked(transport.createSubscription).mockResolvedValueOnce({
-      subscriptionId: "sub-1",
-      filter: { color: "red" },
-      syncToken: EMPTY_SYNC_TOKEN,
-      resetRequired: true,
-    });
-    await client.updateSubscription("sub-1", { color: "red" });
+    await client.updateSubscription(sub1.subscriptionId, { color: "red" });
 
-    // sub-1 is updated in place with the new filter
-    expect(client.getSubscription("sub-1")).toBeDefined();
-    expect(client.getSubscription("sub-1")?.filter).toMatchObject({ color: "red" });
+    // blue-1 matched old filter (color=blue) but not new filter (color=red) and no other sub covers it
+    expect(await client.store.getById("blue-1")).toBeUndefined();
   });
 
   it("does not evict records covered by another active subscription", async () => {
-    vi.mocked(transport.createSubscription)
-      .mockResolvedValueOnce({ subscriptionId: "sub-1", filter: { color: "blue" }, syncToken: EMPTY_SYNC_TOKEN, resetRequired: false })
-      .mockResolvedValueOnce({ subscriptionId: "sub-2", filter: { color: "green" }, syncToken: EMPTY_SYNC_TOKEN, resetRequired: false })
-      .mockResolvedValueOnce({ subscriptionId: "sub-3", filter: { color: "red" }, syncToken: EMPTY_SYNC_TOKEN, resetRequired: true });
+    const sub1 = await client.subscribe({ filter: { color: "blue" } });
+    const sub2 = await client.subscribe({ filter: { color: "blue" } }); // also covers blue
 
-    await client.subscribe({ filter: { color: "blue" } });
-    await client.subscribe({ filter: { color: "green" } });
+    // Give both subs non-empty tokens so they count as coverage
+    const tok = encodeSyncToken({ updatedAt: 1, revisionCount: 1, recordId: "x" });
+    await client.store.setSubscription(sub1.subscriptionId, { ...sub1, syncToken: tok });
+    await client.store.setSubscription(sub2.subscriptionId, { ...sub2, syncToken: tok });
 
     await client.store.write({ recordId: "b1", name: "blue", color: "blue", createdAt: 0, updatedAt: 0, revisionCount: 1 } as unknown as TestRecord);
 
-    await client.updateSubscription("sub-1", { color: "red" });
+    // Update sub1 to red — sub2 still covers blue, so b1 should NOT be evicted
+    await client.updateSubscription(sub1.subscriptionId, { color: "red" });
 
-    // b1 has color=blue, matches evictFilter but also would have been retained if covered by sub-2
-    // sub-2 is { color: "green" } which does NOT cover color=blue, so b1 should be evicted
-    expect(await client.store.getById("b1")).toBeUndefined();
+    expect(await client.store.getById("b1")).toBeDefined();
   });
 });
 
@@ -173,25 +166,23 @@ describe("stream", () => {
         return () => {};
       }),
     };
-    vi.mocked(streamTransport.createSubscription).mockResolvedValue({
-      subscriptionId: "sub-1",
-      filter: {},
-      syncToken: EMPTY_SYNC_TOKEN,
-      resetRequired: false,
-    });
 
     const streamClient = new SyncClient<TestRecord>(streamTransport);
-    await streamClient.subscribe({ filter: {} });
+    const sub = await streamClient.subscribe({ filter: {} });
 
     const receivedPatches: unknown[] = [];
     streamClient.onPatches((p) => receivedPatches.push(...p));
 
     streamClient.stream();
 
+    // Verify stream was called with key+filter+syncToken shape
+    const streamArg = vi.mocked(streamTransport.stream!).mock.calls[0]![0];
+    expect(streamArg[0]).toMatchObject({ key: sub.subscriptionId, filter: {} });
+
     // Simulate SSE message arriving
     await capturedOnMessage!({
       patches: [{ op: "upsert", record: rec() }],
-      syncTokens: { "sub-1": EMPTY_SYNC_TOKEN },
+      syncTokens: { [sub.subscriptionId]: EMPTY_SYNC_TOKEN },
     });
 
     expect(receivedPatches).toHaveLength(1);

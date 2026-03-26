@@ -28,11 +28,6 @@ function note(overrides: Partial<Note> = {}): Note {
 
 function makeTransport(): SyncTransport {
   return {
-    createSubscription: vi.fn(async (filter: SubscriptionFilter) => ({
-      subscriptionId: "sub-1",
-      filter,
-      syncToken: EMPTY_SYNC_TOKEN,
-    })),
     pull: vi.fn(async () => ({ patches: [], syncTokens: {} })),
     push: vi.fn(async () => ({ ok: true as const })),
   };
@@ -90,7 +85,7 @@ describe("useRecords", () => {
     client = makeClient(transport);
   });
 
-  it("subscribes and pulls on mount", async () => {
+  it("subscribes locally and pulls on mount", async () => {
     function Inner() {
       useRecords<Note>({ filter: { title: "hello" } });
       return null;
@@ -99,12 +94,12 @@ describe("useRecords", () => {
     render(<Wrapper client={client}><Inner /></Wrapper>);
 
     await waitFor(() => {
-      expect(transport.createSubscription).toHaveBeenCalledWith(
-        { title: "hello" },
-        undefined,
-      );
       expect(transport.pull).toHaveBeenCalled();
     });
+
+    // Subscription was created locally (no server call)
+    const pullArg = vi.mocked(transport.pull).mock.calls[0]![0];
+    expect(pullArg[0]).toMatchObject({ filter: { title: "hello" } });
   });
 
   it("renders records returned by pull", async () => {
@@ -150,14 +145,10 @@ describe("useRecords", () => {
     });
   });
 
-  it("re-subscribes with previousSubscriptionId when filter changes", async () => {
-    vi.mocked(transport.createSubscription)
-      .mockResolvedValueOnce({ subscriptionId: "sub-1", filter: {}, syncToken: EMPTY_SYNC_TOKEN })
-      .mockResolvedValueOnce({ subscriptionId: "sub-2", filter: { title: "new" }, syncToken: EMPTY_SYNC_TOKEN });
-
+  it("re-subscribes locally when filter changes and issues a new pull", async () => {
     function Inner() {
       const [filter, setFilter] = useState<SubscriptionFilter>({});
-      const notes = useRecords<Note>({ filter, pollInterval: 0 });
+      const notes = useRecords<Note>({ filter });
       return (
         <>
           <button onClick={() => setFilter({ title: "new" })}>change</button>
@@ -168,19 +159,21 @@ describe("useRecords", () => {
 
     render(<Wrapper client={client}><Inner /></Wrapper>);
 
-    await waitFor(() => expect(transport.createSubscription).toHaveBeenCalledTimes(1));
+    // Initial pull happens on mount
+    await waitFor(() => expect(transport.pull).toHaveBeenCalledTimes(1));
 
     await act(async () => {
       screen.getByText("change").click();
     });
 
+    // A second pull is issued after the filter change
     await waitFor(() => {
-      expect(transport.createSubscription).toHaveBeenCalledTimes(2);
-      expect(transport.createSubscription).toHaveBeenLastCalledWith(
-        { title: "new" },
-        "sub-1",
-      );
+      expect(transport.pull).toHaveBeenCalledTimes(2);
     });
+
+    // The second pull uses the new filter
+    const secondPullArg = vi.mocked(transport.pull).mock.calls[1]![0];
+    expect(secondPullArg[0]).toMatchObject({ filter: { title: "new" } });
   });
 });
 

@@ -1,13 +1,13 @@
 # @sync-subscribe/client
 
-Framework-agnostic sync client for `sync-subscribe`. Manages subscriptions, a local in-memory store, and pull/push cycles against any HTTP transport you provide.
+Framework-agnostic sync client for `sync-subscribe`. Manages subscriptions locally, maintains a local store, and runs pull/push cycles against any HTTP transport you provide.
 
 ## Concepts
 
 | Term | Description |
 |---|---|
 | `SyncRecord` | Every synced record must have `recordId`, `createdAt`, `updatedAt`, `revisionCount` |
-| `SyncTransport` | Your HTTP adapter — implement `createSubscription`, `pull`, `push` |
+| `SyncTransport` | Your HTTP adapter — implement `pull`, `push`, and optionally `stream` |
 | `SyncClient` | Orchestrates subscriptions, local state, pull, push, and patch listeners |
 | `ILocalStore` | Async interface for local storage — both built-in stores implement it |
 | `LocalStore` | In-memory store (default); fast but data is lost on page reload |
@@ -34,41 +34,43 @@ interface NoteRecord extends SyncRecord {
 }
 ```
 
-### 2. Implement `SyncTransport`
+### 2. Create a transport
 
-The transport is a thin adapter over your HTTP layer. Use `fetch`, `axios`, or anything else.
+Use the built-in `createFetchTransport` for standard fetch-based HTTP:
+
+```ts
+import { createFetchTransport } from "@sync-subscribe/client";
+
+const transport = createFetchTransport({
+  baseUrl: "/api",
+  headers: () => ({ Authorization: `Bearer ${getToken()}` }),
+});
+```
+
+Or implement `SyncTransport` yourself for full control:
 
 ```ts
 import type { SyncTransport } from "@sync-subscribe/client";
-import type { SubscriptionFilter, SyncToken } from "@sync-subscribe/core";
 
-function createTransport(): SyncTransport {
-  return {
-    async createSubscription(filter: SubscriptionFilter, previousSubscriptionId?: string) {
-      const res = await fetch("/api/subscriptions", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filter, previousSubscriptionId }),
-      });
-      return res.json(); // { subscriptionId, syncToken, resetRequired }
-    },
+const transport: SyncTransport = {
+  async pull(subscriptions) {
+    const res = await fetch("/api/sync/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscriptions }), // [{ key, filter, syncToken }]
+    });
+    return res.json(); // { patches, syncTokens }
+  },
 
-    async pull(subscriptionId: string, syncToken: SyncToken) {
-      const qs = new URLSearchParams({ subscriptionId, syncToken });
-      const res = await fetch(`/api/sync?${qs}`);
-      return res.json(); // { patches, syncToken }
-    },
-
-    async push(subscriptionId: string, records: unknown[]) {
-      const res = await fetch("/api/sync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscriptionId, records }),
-      });
-      return res.json(); // { ok: true } or { conflict: true, serverRecord }
-    },
-  };
-}
+  async push(records) {
+    const res = await fetch("/api/sync/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records }),
+    });
+    return res.json(); // { ok: true } or { conflict: true, serverRecord }
+  },
+};
 ```
 
 ### 3. Create a client and sync
@@ -76,15 +78,15 @@ function createTransport(): SyncTransport {
 ```ts
 import { SyncClient } from "@sync-subscribe/client";
 
-const client = new SyncClient<NoteRecord>(createTransport());
+const client = new SyncClient<NoteRecord>(transport);
 
-// Subscribe to a filtered subset of records
-const sub = await client.subscribe({ filter: { isDeleted: false } });
+// Register a subscription locally (no server call)
+await client.subscribe({ filter: { isDeleted: false } });
 
-// Pull all pending patches from the server
+// Pull pending patches from the server
 await client.pull();
 
-// Read local state (all store methods are async)
+// Read local state
 const notes = await client.store.getAll();
 ```
 
@@ -96,38 +98,55 @@ Pass an `IdbLocalStore` as the second argument to survive page reloads:
 import { SyncClient, IdbLocalStore } from "@sync-subscribe/client";
 
 const client = new SyncClient<NoteRecord>(
-  createTransport(),
-  new IdbLocalStore("notes-db"),  // data persists across reloads
+  transport,
+  new IdbLocalStore("notes-db"),
 );
 ```
 
-The `IdbLocalStore` constructor takes a `dbName` and an optional `storeName` (default `"records"`). Use a unique `dbName` per collection or per user if you need data isolation on the same origin.
-
 ## Subscriptions
 
-Each call to `subscribe` registers a filter with the server and stores a `ClientSubscription` locally. You can hold multiple overlapping subscriptions — records matching more than one filter are stored only once in `LocalStore`.
+`subscribe` registers a filter locally and returns a `ClientSubscription`. The filter is sent to the server on every `pull` or `stream` call. You can hold multiple overlapping subscriptions — records matching more than one filter are stored only once in the local store.
 
 ```ts
 const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
 
-// Operator-based filter
+// Time-range filter
 await client.subscribe({ filter: { createdAt: { $gte: thirtyDaysAgo } } });
 
 // Equality filter — overlaps are fine, deduped locally
 await client.subscribe({ filter: { color: "blue" } });
 
-await client.pull(); // fetches patches for both subscriptions
+await client.pull(); // fetches patches for both subscriptions in one request
 ```
 
-Available filter operators: `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, or a plain equality value.
+Available filter operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$or`, `$and`, `$nor`.
+
+### Named subscriptions
+
+Pass `name` to persist and restore subscription state across sessions (requires `IdbLocalStore`):
+
+```ts
+await client.subscribe({ filter: { isDeleted: false }, name: "active-notes" });
+```
+
+On the next session, `subscribe` with the same `name` and same filter reuses the stored `syncToken`, enabling incremental sync instead of a full re-fetch.
+
+### Updating a subscription
+
+```ts
+// Replace the filter on an existing subscription
+await client.updateSubscription(sub.subscriptionId, { color: "red" });
+```
+
+The client runs gap and eviction analysis locally: it detects whether any records matching the new filter are not yet cached (gap), fetches them, and evicts records that only the old filter needed.
 
 ## Mutating records
 
-`mutate` writes the record locally immediately (read-your-own-writes), then pushes it to the server. Returns `true` on success, `false` if the server detected a conflict (in which case the server's version is applied locally).
+`mutate` writes the record locally immediately (read-your-own-writes), then pushes to the server. Returns `true` on success, `false` if the server detected a conflict (server record wins).
 
 ```ts
 // Create
-const note: NoteRecord = {
+await client.mutate({
   recordId: crypto.randomUUID(),
   createdAt: Date.now(),
   updatedAt: Date.now(),
@@ -135,10 +154,9 @@ const note: NoteRecord = {
   title: "Hello",
   contents: "World",
   isDeleted: false,
-};
-await client.mutate(note);
+});
 
-// Update — increment revisionCount on every mutation
+// Update — always increment revisionCount
 await client.mutate({
   ...note,
   contents: "Updated",
@@ -159,7 +177,7 @@ await client.mutate({
 
 ## Listening for changes
 
-`onPatches` fires whenever the local store changes, either from an incoming pull or a conflict resolution after a push. Returns an unsubscribe function.
+`onPatches` fires whenever the local store changes from an incoming pull or conflict resolution. Returns an unsubscribe function.
 
 ```ts
 const unsub = client.onPatches((patches) => {
@@ -167,69 +185,35 @@ const unsub = client.onPatches((patches) => {
     if (patch.op === "upsert") console.log("upserted", patch.record.recordId);
     if (patch.op === "delete") console.log("deleted", patch.recordId);
   }
-  // Re-read local state (store methods are async)
-  client.store.getAll().then((records) => console.log(records));
 });
 
-// Later — stop listening
-unsub();
+unsub(); // stop listening
 ```
+
+## SSE streaming
+
+If your transport implements `stream`, the client can open a persistent SSE connection instead of polling:
+
+```ts
+// stream() returns a cleanup function
+const stop = client.stream();
+
+// Later, on teardown
+stop();
+```
+
+Only `active` subscriptions participate in the stream. The client sends `[{ key, filter, syncToken }]` via POST so the server knows which filters to watch and where each subscription left off.
 
 ## Polling
 
-There is no built-in polling timer. Set one up yourself and cancel it on teardown:
+There is no built-in polling timer. Set one up yourself:
 
 ```ts
 const timer = setInterval(async () => {
   try { await client.pull(); } catch { /* retry next tick */ }
 }, 5000);
 
-// On teardown
-clearInterval(timer);
-```
-
-## React example
-
-```tsx
-import { useEffect, useCallback, useRef, useState } from "react";
-import { SyncClient } from "@sync-subscribe/client";
-
-// Create once at module level so it survives re-renders
-const client = new SyncClient<NoteRecord>(createTransport());
-
-export function NotesList() {
-  const [notes, setNotes] = useState<NoteRecord[]>([]);
-  const initialized = useRef(false);
-
-  const refresh = useCallback(() => {
-    client.store.getAll().then((records) => setNotes(records.filter((n) => !n.isDeleted)));
-  }, []);
-
-  useEffect(() => {
-    if (initialized.current) return;
-    initialized.current = true;
-
-    let cancelled = false;
-
-    async function init() {
-      await client.subscribe({ filter: { isDeleted: false } });
-      await client.pull();
-      if (!cancelled) refresh();
-    }
-    init();
-
-    const unsub = client.onPatches(() => { if (!cancelled) refresh(); });
-    const timer = setInterval(() => client.pull().catch(() => {}), 5000);
-
-    return () => {
-      cancelled = true;
-      unsub();
-      clearInterval(timer);
-    };
-  }, [refresh]);
-
-  return <ul>{notes.map((n) => <li key={n.recordId}>{n.title}</li>)}</ul>;
-}
+clearInterval(timer); // on teardown
 ```
 
 ## Resetting state
@@ -246,32 +230,48 @@ await client.reset();
 
 | Method | Description |
 |---|---|
-| `subscribe(options)` | Register a filter with the server; returns `ClientSubscription` |
+| `subscribe(options)` | Register a filter locally; returns `ClientSubscription` |
+| `updateSubscription(id, filter)` | Replace a subscription's filter; handles gap/eviction locally |
 | `pull()` | Fetch pending patches for all active subscriptions |
+| `schedulePull(delayMs?)` | Debounced pull — collapses rapid concurrent calls into one request |
 | `mutate(record)` | Write locally + push to server; returns `false` on conflict |
+| `stream()` | Open SSE stream for all active subscriptions; returns cleanup function |
 | `onPatches(listener)` | Listen for store changes; returns an unsubscribe function |
-| `getSubscription(id)` | Look up a subscription by id |
-| `reset()` | Clear all subscriptions and local store (async) |
-| `store` | The `LocalStore<T>` instance for direct reads |
-
-### `ILocalStore<T>` — implemented by `LocalStore` and `IdbLocalStore`
-
-All methods are async and return Promises.
-
-| Method | Description |
-|---|---|
-| `getAll()` | Return all records |
-| `getById(recordId)` | Return a single record or `undefined` |
-| `applyPatches(patches)` | Apply server patches; returns only the patches that changed local state |
-| `write(record)` | Write a record locally (used by `mutate` — not normally called directly) |
-| `clear()` | Remove all records (called by `reset()`) |
+| `getSubscription(key)` | Look up a subscription by `subscriptionId` or `name` |
+| `reset()` | Clear all subscriptions and local store |
+| `store` | The `ILocalStore<T>` instance for direct reads |
 
 ### `SyncTransport`
 
 ```ts
 interface SyncTransport {
-  createSubscription(filter, previousSubscriptionId?): Promise<ClientSubscription>;
-  pull(subscriptionId, syncToken): Promise<{ patches, syncToken }>;
-  push(subscriptionId, records): Promise<{ ok: true } | { conflict: true; serverRecord }>;
+  pull(subscriptions: { key: string; filter: SubscriptionFilter; syncToken: SyncToken }[]): Promise<{
+    patches: SyncPatch<SyncRecord>[];
+    syncTokens: Record<string, SyncToken>;
+  }>;
+
+  push(records: SyncRecord[]): Promise<
+    | { ok: true; serverUpdatedAt: number }
+    | { conflict: true; serverRecord: SyncRecord }
+  >;
+
+  stream?(
+    subscriptions: { key: string; filter: SubscriptionFilter; syncToken: SyncToken }[],
+    onMessage: (event: { patches: SyncPatch<SyncRecord>[]; syncTokens: Record<string, SyncToken> }) => void,
+    onError?: (err: Error) => void,
+  ): () => void;
 }
 ```
+
+### `ILocalStore<T>` — implemented by `LocalStore` and `IdbLocalStore`
+
+| Method | Description |
+|---|---|
+| `getAll()` | Return all records |
+| `getById(recordId)` | Return a single record or `undefined` |
+| `query(filter)` | Return records matching a filter |
+| `applyPatches(patches)` | Apply server patches; returns only patches that changed local state |
+| `write(record)` | Write a record locally (used by `mutate`) |
+| `evict(filter)` | Remove records matching a filter without deleting them from the server |
+| `reconstructSyncToken(filter)` | Build a sync token from the latest locally-cached record matching `filter` |
+| `clear()` | Remove all records |

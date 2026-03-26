@@ -76,7 +76,7 @@ export interface ConflictResult<T extends SyncRecord> {
 // ---------------------------------------------------------------------------
 
 export interface PullRequest {
-  subscriptions: { id: string; syncToken: SyncToken }[];
+  subscriptions: { key: string; filter: SubscriptionFilter; syncToken: SyncToken }[];
 }
 
 export interface PullResponse<T extends SyncRecord = SyncRecord> {
@@ -103,5 +103,5 @@ export interface StreamEvent<T extends SyncRecord = SyncRecord> {
 
 /** Request body when opening a stream connection. */
 export interface StreamRequest {
-  subscriptions: { id: string; syncToken: SyncToken }[];
+  subscriptions: { key: string; filter: SubscriptionFilter; syncToken: SyncToken }[];
 }

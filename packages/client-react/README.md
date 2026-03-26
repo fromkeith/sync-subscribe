@@ -13,13 +13,12 @@ React ≥ 18 is a peer dependency.
 ## Quick start
 
 ```tsx
-import { SyncClient, IdbLocalStore } from "@sync-subscribe/client";
+import { SyncClient, IdbLocalStore, createFetchTransport } from "@sync-subscribe/client";
 import { SyncProvider, useRecords, useMutate } from "@sync-subscribe/client-react";
-import { createTransport } from "./transport";
 
 // Create the client once at module level (outside components)
 const client = new SyncClient(
-  createTransport(),
+  createFetchTransport({ baseUrl: "/api" }),
   new IdbLocalStore("my-app-db"), // persists across reloads; omit for in-memory
 );
 
@@ -80,15 +79,14 @@ Subscribes to a filtered view of records and returns them as a live array.
 ```ts
 const notes = useRecords<NoteRecord>({
   filter: { isDeleted: false },
-  pollInterval: 5000, // optional, default 5000ms; set 0 to disable
+  name: "active-notes", // optional — persists subscription state across sessions
 });
 ```
 
 **What it does:**
-- On mount: creates a server subscription for `filter`, pulls the initial batch, and populates the local store
-- Re-renders on every incoming patch (from pull or conflict resolution)
-- Polls the server every `pollInterval` ms
-- When `filter` changes: replaces the subscription via `previousSubscriptionId` so the server can compute a minimal diff rather than a full re-sync
+- On mount: registers a subscription locally for `filter`, pulls the initial batch, and opens an SSE stream
+- Re-renders on every incoming patch (from pull, stream, or conflict resolution)
+- When `filter` changes: registers a new subscription, replacing the old one. Gap analysis runs locally to determine whether any records matching the new filter are not yet cached — if so they are fetched before joining the stream. Records that only the old filter needed are evicted.
 - Filters the local store client-side with `matchesFilter`, so multiple overlapping `useRecords` calls with different filters work correctly
 
 **Filter operators:**
@@ -102,6 +100,9 @@ useRecords({ filter: { createdAt: { $gte: Date.now() - 30 * 24 * 60 * 60 * 1000 
 
 // Multiple conditions (all must match)
 useRecords({ filter: { isDeleted: false, category: "work" } });
+
+// $or
+useRecords({ filter: { $or: [{ color: "blue" }, { color: "red" }] } });
 ```
 
 **Stable filter references:**
@@ -187,23 +188,10 @@ If a push fails after reconnecting (e.g. the server is still unreachable), the r
 
 ## Multiple subscriptions
 
-Multiple `useRecords` calls create independent server subscriptions. The local store deduplicates records by `recordId`, so records matching more than one filter are only stored once. Each hook filters client-side to return its own view.
+Multiple `useRecords` calls create independent subscriptions. The local store deduplicates records by `recordId`, so records matching more than one filter are stored only once. Each hook filters client-side to return its own view.
 
 ```tsx
 // Two subscriptions, no duplicates in the local store
 const recentNotes = useRecords({ filter: { createdAt: { $gte: thirtyDaysAgo } } });
 const blueNotes   = useRecords({ filter: { color: "blue" } });
-```
-
----
-
-## Disabling polling (SSE)
-
-Set `pollInterval: 0` and use SSE streaming from the server instead:
-
-```tsx
-const notes = useRecords({ filter: { isDeleted: false }, pollInterval: 0 });
-
-// In a separate effect, connect to your SSE endpoint and call client.pull()
-// (or apply patches directly) whenever an event arrives.
 ```
