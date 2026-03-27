@@ -19,6 +19,7 @@ import type {
   PersistedSubscription,
   SubscriptionStatus,
   SyncSubscriptionRequest,
+  SyncQuery,
   SyncTransport,
 } from "./types.js";
 import { InMemoryStore } from "./inMemoryStore.js";
@@ -35,6 +36,8 @@ export class SyncClient<T extends SyncRecord> {
   private listeners: PatchListener<T>[] = [];
   private activeSubs = new Map<string, PersistedSubscription>(); // keyed by subscriptionId
   private subActiveListeners = new Map<string, Set<() => void>>(); // keyed by subscriptionId
+  private _stopStream: (() => void) | null = null;
+  private _streamTimer: ReturnType<typeof setTimeout> | null = null;
 
   private pendingPull: {
     promise: Promise<void>;
@@ -147,6 +150,10 @@ export class SyncClient<T extends SyncRecord> {
 
     await this.store.setSubscription(key, newSub);
     this.activeSubs.set(newSubscriptionId, newSub);
+
+    // Automatically kick off a pull and (re)start the stream for the new subscription.
+    void this.schedulePull();
+    this._syncStream();
 
     return newSub;
   }
@@ -376,11 +383,18 @@ export class SyncClient<T extends SyncRecord> {
    * Returns true on success, false if a conflict was detected (server wins).
    */
   async mutate(record: T): Promise<boolean> {
-    await this.store.write(record);
-    // Optimistic update — notify listeners immediately so the UI reflects the change.
-    this.emit([{ op: "upsert", record }]);
+    const existing = await this.store.getById(record.recordId);
+    const stamped: T = {
+      ...record,
+      updatedAt: Date.now(),
+      revisionCount: (existing?.revisionCount ?? 0) + 1,
+    };
 
-    const result = await this.transport.push([record]);
+    await this.store.write(stamped);
+    // Optimistic update — notify listeners immediately so the UI reflects the change.
+    this.emit([{ op: "upsert", record: stamped }]);
+
+    const result = await this.transport.push([stamped]);
 
     if ("conflict" in result && result.conflict) {
       // Server wins: overwrite local record with server version.
@@ -396,7 +410,7 @@ export class SyncClient<T extends SyncRecord> {
     const serverUpdatedAt = (result as { ok: true; serverUpdatedAt?: number })
       .serverUpdatedAt;
     if (serverUpdatedAt !== undefined) {
-      await this.store.setServerUpdatedAt(record.recordId, serverUpdatedAt);
+      await this.store.setServerUpdatedAt(stamped.recordId, serverUpdatedAt);
       const updated = await this.store.getById(record.recordId);
       if (updated) this.emit([{ op: "upsert", record: updated }]);
     }
@@ -404,27 +418,147 @@ export class SyncClient<T extends SyncRecord> {
   }
 
   // ---------------------------------------------------------------------------
-  // Streaming
+  // Queries
   // ---------------------------------------------------------------------------
 
   /**
-   * Open a single SSE stream for all ACTIVE subscriptions.
-   * PENDING subscriptions (awaiting gap fill) are excluded until they transition.
-   * Returns a cleanup function — call it to close the connection.
+   * Returns a reactive handle to a filtered view of the local store.
+   * Does NOT register a sync subscription — use this when data is already
+   * being synced via a separate `subscribe()` call (e.g. a background sync).
+   *
+   * Loading starts `true`, becomes `false` after the first local read.
+   * Re-runs whenever the store changes (pull patches, mutations).
    */
-  stream(): () => void {
-    if (!this.transport.stream) {
-      throw new Error(
-        "Transport does not support streaming — implement transport.stream()",
-      );
+  query(options: { filter: SubscriptionFilter<T> }): SyncQuery<T> {
+    const { filter } = options;
+    return {
+      subscribe: (run, _invalidate) => {
+        let cancelled = false;
+        run({ data: [], loading: true });
+
+        this.store
+          .query(filter)
+          .then((data) => { if (!cancelled) run({ data, loading: false }); })
+          .catch(console.error);
+
+        const offPatches = this.onPatches(async () => {
+          if (cancelled) return;
+          const data = await this.store.query(filter);
+          if (!cancelled) run({ data, loading: false });
+        });
+
+        return () => {
+          cancelled = true;
+          offPatches();
+        };
+      },
+    };
+  }
+
+  /**
+   * Returns a reactive handle that also manages its own sync subscription.
+   * The sync subscription is registered when the first caller subscribes and
+   * removed when the last caller unsubscribes.
+   *
+   * Use this when the sync filter and the query filter are the same.
+   * For a narrower in-memory view of a broader background sync, use `query()`.
+   */
+  liveQuery(options: {
+    filter: SubscriptionFilter<T>;
+    name?: string;
+  }): SyncQuery<T> {
+    const { filter, name } = options;
+    let refCount = 0;
+    let sessionCleanup: (() => void) | undefined;
+    const runs = new Set<(value: { data: T[]; loading: boolean }) => void>();
+
+    const refresh = async () => {
+      const data = await this.store.query(filter);
+      for (const run of runs) run({ data, loading: false });
+    };
+
+    return {
+      subscribe: (run, _invalidate) => {
+        refCount++;
+        runs.add(run);
+        run({ data: [], loading: true });
+
+        if (refCount === 1) {
+          // Per-session state so that a React StrictMode unmount+remount
+          // (cleanup fires before the subscribe promise resolves) is handled safely.
+          let subId: string | undefined;
+          let cancelled = false;
+          const offPatches = this.onPatches(() => {
+            if (!cancelled) refresh().catch(console.error);
+          });
+
+          this.subscribe({ filter, ...(name !== undefined && { name }) })
+            .then((sub) => {
+              if (cancelled) {
+                // Cleanup raced the subscribe — discard the subscription immediately.
+                this.unsubscribe(sub.subscriptionId).catch(console.error);
+                return;
+              }
+              subId = sub.subscriptionId;
+              return refresh();
+            })
+            .catch(console.error);
+
+          sessionCleanup = () => {
+            cancelled = true;
+            offPatches();
+            if (subId !== undefined) {
+              this.unsubscribe(subId).catch(console.error);
+              subId = undefined;
+            }
+            sessionCleanup = undefined;
+          };
+        } else {
+          refresh().catch(console.error);
+        }
+
+        return () => {
+          runs.delete(run);
+          refCount--;
+          if (refCount === 0) sessionCleanup?.();
+        };
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Streaming (managed internally)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Debounced (re)start of the SSE stream. Collapses multiple rapid calls
+   * (e.g. several hooks subscribing at once) into a single connection open.
+   * Called automatically by subscribe(), unsubscribe(), and gap-fill completion.
+   */
+  private _syncStream(delayMs = 20): void {
+    if (this._streamTimer !== null) {
+      clearTimeout(this._streamTimer);
     }
+    this._streamTimer = setTimeout(() => {
+      this._streamTimer = null;
+      this._applyStreamState();
+    }, delayMs);
+  }
+
+  private _applyStreamState(): void {
+    if (this._stopStream) {
+      this._stopStream();
+      this._stopStream = null;
+    }
+
+    if (!this.transport.stream) return;
 
     const subs = [...this.activeSubs.values()].filter(
       (s) => (s.status ?? "active") === "active",
     );
-    if (subs.length === 0) return () => {};
+    if (subs.length === 0) return;
 
-    return this.transport.stream(
+    this._stopStream = this.transport.stream(
       subs.map((s) => ({
         key: s.subscriptionId,
         filter: s.filter as SubscriptionFilter,
@@ -449,6 +583,26 @@ export class SyncClient<T extends SyncRecord> {
       },
       (err) => console.error("[SyncClient] SSE error:", err),
     );
+  }
+
+  /**
+   * Remove a subscription and restart the stream without it.
+   * If no active subscriptions remain the stream is stopped.
+   */
+  async unsubscribe(subscriptionId: string): Promise<void> {
+    const sub = this.activeSubs.get(subscriptionId);
+    if (!sub) return;
+
+    if (sub.gapSubscriptionId) {
+      await this.store.removeSubscription(sub.gapSubscriptionId);
+      this.subActiveListeners.delete(subscriptionId);
+    }
+
+    const key = sub.name ?? subscriptionId;
+    await this.store.removeSubscription(key);
+    this.activeSubs.delete(subscriptionId);
+
+    this._syncStream();
   }
 
   // ---------------------------------------------------------------------------
@@ -487,6 +641,8 @@ export class SyncClient<T extends SyncRecord> {
       for (const l of listeners) l();
       this.subActiveListeners.delete(subscriptionId);
     }
+    // Subscription just became active — restart stream to include it.
+    this._syncStream();
   }
 
   private emit(patches: SyncPatch<T>[]): void {
@@ -518,6 +674,14 @@ export class SyncClient<T extends SyncRecord> {
 
   /** Resets sync state (useful for logout / account switch). */
   async reset(): Promise<void> {
+    if (this._streamTimer !== null) {
+      clearTimeout(this._streamTimer);
+      this._streamTimer = null;
+    }
+    if (this._stopStream) {
+      this._stopStream();
+      this._stopStream = null;
+    }
     this.activeSubs.clear();
     await this.store.clear();
     await this.store.clearSubscriptions();

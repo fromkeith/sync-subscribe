@@ -9,5 +9,6 @@ export type {
   ILocalStore,
   PatchListener,
   PersistedSubscription,
+  SyncQuery,
   SyncTransport,
 } from "./types.js";

@@ -136,3 +136,22 @@ export interface ILocalStore<T extends SyncRecord> {
 export type PatchListener<T extends SyncRecord> = (
   patches: SyncPatch<T>[],
 ) => void;
+
+export interface QueryEntries<T extends SyncRecord> {
+  data: T[];
+  loading: boolean;
+}
+
+/**
+ * A reactive handle to a filtered view of the local store.
+ * Follows the Svelte store contract — subscribe(run) returns unsubscribe.
+ *
+ * `loading` is true until the first local read (or first pull for liveQuery) completes.
+ * Compatible with Svelte's `$store` syntax and React's `useSyncExternalStore`.
+ */
+export interface SyncQuery<T extends SyncRecord> {
+  subscribe(
+    run: (value: QueryEntries<T>) => void,
+    invalidate?: () => void,
+  ): () => void;
+}

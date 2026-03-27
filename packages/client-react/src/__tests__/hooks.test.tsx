@@ -1,11 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, waitFor } from "@testing-library/react";
-import React, { useState } from "react";
-import { EMPTY_SYNC_TOKEN } from "@sync-subscribe/core";
-import type { SyncRecord, SubscriptionFilter, SyncToken } from "@sync-subscribe/core";
-import { SyncClient, LocalStore } from "@sync-subscribe/client";
-import type { SyncTransport } from "@sync-subscribe/client";
-import { SyncProvider, useSyncClient, useRecords, useMutate } from "../index.js";
+import { render, screen, act, waitFor, within } from "@testing-library/react";
+import React, { useMemo, useState } from "react";
+import type { SyncRecord, SubscriptionFilter } from "@sync-subscribe/core";
+import { SyncClient } from "@sync-subscribe/client";
+import type { SyncTransport, SyncQuery, QueryEntries } from "@sync-subscribe/client";
+import { SyncProvider, useSyncClient, useRecords, useMutate, useQuery } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Shared test helpers
@@ -29,7 +28,7 @@ function note(overrides: Partial<Note> = {}): Note {
 function makeTransport(): SyncTransport {
   return {
     pull: vi.fn(async () => ({ patches: [], syncTokens: {} })),
-    push: vi.fn(async () => ({ ok: true as const })),
+    push: vi.fn(async () => ({ ok: true as const, serverUpdatedAt: 3000 })),
   };
 }
 
@@ -40,6 +39,8 @@ function makeClient(transport: SyncTransport) {
 function Wrapper({ client, children }: { client: SyncClient<Note>; children: React.ReactNode }) {
   return <SyncProvider client={client}>{children}</SyncProvider>;
 }
+
+const flushPromises = () => new Promise<void>((r) => setTimeout(r, 0));
 
 // ---------------------------------------------------------------------------
 // useSyncClient
@@ -97,9 +98,26 @@ describe("useRecords", () => {
       expect(transport.pull).toHaveBeenCalled();
     });
 
-    // Subscription was created locally (no server call)
     const pullArg = vi.mocked(transport.pull).mock.calls[0]![0];
     expect(pullArg[0]).toMatchObject({ filter: { title: "hello" } });
+  });
+
+  it("starts with loading: true and becomes false after pull", async () => {
+    let capturedLoading: boolean | undefined;
+
+    function Inner() {
+      const { loading } = useRecords<Note>({ filter: {} });
+      capturedLoading = loading;
+      return <span>{loading ? "loading" : "done"}</span>;
+    }
+
+    render(<Wrapper client={client}><Inner /></Wrapper>);
+    expect(capturedLoading).toBe(true);
+
+    await waitFor(() => {
+      expect(screen.getByText("done")).toBeTruthy();
+    });
+    expect(capturedLoading).toBe(false);
   });
 
   it("renders records returned by pull", async () => {
@@ -109,7 +127,7 @@ describe("useRecords", () => {
     });
 
     function Inner() {
-      const notes = useRecords<Note>({ filter: {}, pollInterval: 0 });
+      const { data: notes } = useRecords<Note>({ filter: {} });
       return <ul>{notes.map((n) => <li key={n.recordId}>{n.title}</li>)}</ul>;
     }
 
@@ -122,58 +140,153 @@ describe("useRecords", () => {
 
   it("re-renders when a patch arrives via onPatches", async () => {
     function Inner() {
-      const notes = useRecords<Note>({ filter: {}, pollInterval: 0 });
+      const { data: notes } = useRecords<Note>({ filter: {} });
       return <ul>{notes.map((n) => <li key={n.recordId}>{n.title}</li>)}</ul>;
     }
 
     render(<Wrapper client={client}><Inner /></Wrapper>);
 
     await act(async () => {
-      await client.store.write(note({ title: "patched" }));
-      // Trigger listeners manually (simulates a pull result)
-      await (client as unknown as { emit: (p: unknown[]) => void }).emit?.([
-        { op: "upsert", record: note({ title: "patched" }) },
-      ]);
-      // Directly fire onPatches by applying a patch so the store listener fires
       await client.store.applyPatches([{ op: "upsert", record: note({ title: "patched" }) }]);
+      await flushPromises();
     });
 
-    // Flush state: refresh reads store, store now has "patched"
-    await waitFor(async () => {
-      const all = await client.store.getAll();
-      expect(all[0]?.title).toBe("patched");
+    await waitFor(() => {
+      expect(screen.getByText("patched")).toBeTruthy();
     });
   });
 
-  it("re-subscribes locally when filter changes and issues a new pull", async () => {
+  it("re-subscribes when filter changes and issues a new pull", async () => {
     function Inner() {
       const [filter, setFilter] = useState<SubscriptionFilter>({});
-      const notes = useRecords<Note>({ filter });
+      const { data: notes } = useRecords<Note>({ filter });
       return (
         <>
           <button onClick={() => setFilter({ title: "new" })}>change</button>
-          <span>{notes.length}</span>
+          <span data-testid="count">{notes.length}</span>
         </>
       );
     }
 
     render(<Wrapper client={client}><Inner /></Wrapper>);
 
-    // Initial pull happens on mount
     await waitFor(() => expect(transport.pull).toHaveBeenCalledTimes(1));
 
     await act(async () => {
       screen.getByText("change").click();
     });
 
-    // A second pull is issued after the filter change
     await waitFor(() => {
       expect(transport.pull).toHaveBeenCalledTimes(2);
     });
 
-    // The second pull uses the new filter
     const secondPullArg = vi.mocked(transport.pull).mock.calls[1]![0];
     expect(secondPullArg[0]).toMatchObject({ filter: { title: "new" } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// useQuery
+// ---------------------------------------------------------------------------
+
+describe("useQuery", () => {
+  it("starts with loading: true", () => {
+    let subscriber: ((value: QueryEntries<Note>) => void) | undefined;
+    const mockQuery: SyncQuery<Note> = {
+      subscribe(run) {
+        subscriber = run;
+        // Don't emit anything yet — simulate async load
+        return () => { subscriber = undefined; };
+      },
+    };
+
+    let capturedState: QueryEntries<Note> | undefined;
+    function Inner() {
+      const q = useMemo(() => mockQuery, []);
+      capturedState = useQuery(q);
+      return null;
+    }
+
+    render(<Inner />);
+    expect(capturedState).toEqual({ data: [], loading: true });
+    void subscriber; // prevent unused warning
+  });
+
+  it("reflects emitted values from the syncQuery", async () => {
+    let emit!: (value: QueryEntries<Note>) => void;
+    const mockQuery: SyncQuery<Note> = {
+      subscribe(run) {
+        emit = run;
+        run({ data: [], loading: true });
+        return () => {};
+      },
+    };
+
+    function Inner() {
+      const q = useMemo(() => mockQuery, []);
+      const { data, loading } = useQuery(q);
+      return <span>{loading ? "loading" : data.map((n) => n.title).join(",")}</span>;
+    }
+
+    const { container } = render(<Inner />);
+    expect(within(container).getByText("loading")).toBeTruthy();
+
+    await act(async () => {
+      emit({ data: [note()], loading: false });
+    });
+
+    expect(within(container).getByText("hello")).toBeTruthy();
+  });
+
+  it("unsubscribes from the syncQuery on unmount", () => {
+    const unsubscribe = vi.fn();
+    const mockQuery: SyncQuery<Note> = {
+      subscribe(run) {
+        run({ data: [], loading: false });
+        return unsubscribe;
+      },
+    };
+
+    function Inner() {
+      const q = useMemo(() => mockQuery, []);
+      useQuery(q);
+      return null;
+    }
+
+    const { unmount } = render(<Inner />);
+    expect(unsubscribe).not.toHaveBeenCalled();
+    unmount();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-subscribes when syncQuery reference changes", async () => {
+    const unsub1 = vi.fn();
+    const unsub2 = vi.fn();
+    let emitFirst!: (value: QueryEntries<Note>) => void;
+    let emitSecond!: (value: QueryEntries<Note>) => void;
+
+    const query1: SyncQuery<Note> = {
+      subscribe(run) { emitFirst = run; run({ data: [], loading: false }); return unsub1; },
+    };
+    const query2: SyncQuery<Note> = {
+      subscribe(run) { emitSecond = run; run({ data: [note()], loading: false }); return unsub2; },
+    };
+
+    function Inner({ q }: { q: SyncQuery<Note> }) {
+      const { data } = useQuery(q);
+      return <span>{data.map((n) => n.title).join(",") || "empty"}</span>;
+    }
+
+    const { container, rerender } = render(<Inner q={query1} />);
+    expect(within(container).getByText("empty")).toBeTruthy();
+
+    await act(async () => {
+      rerender(<Inner q={query2} />);
+    });
+
+    expect(unsub1).toHaveBeenCalledTimes(1);
+    expect(within(container).getByText("hello")).toBeTruthy();
+    void emitFirst; void emitSecond;
   });
 });
 
@@ -200,8 +313,7 @@ describe("useMutate", () => {
     spy.mockRestore();
   });
 
-  it("calls client.mutate when online", async () => {
-    // jsdom sets navigator.onLine = true by default
+  it("calls client.mutate when online and pushes the record", async () => {
     let mutate!: (r: Note) => Promise<boolean>;
 
     function Inner() {
@@ -218,10 +330,13 @@ describe("useMutate", () => {
     });
 
     expect(result).toBe(true);
-    expect(transport.push).toHaveBeenCalledWith([note()]);
+    // mutate stamps updatedAt and revisionCount, so use partial match
+    expect(transport.push).toHaveBeenCalledWith([
+      expect.objectContaining({ recordId: "n1", title: "hello" }),
+    ]);
   });
 
-  it("queues mutation and writes locally when offline", async () => {
+  it("queues mutation when offline without pushing", async () => {
     Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
 
     let mutate!: (r: Note) => Promise<boolean>;
@@ -239,12 +354,43 @@ describe("useMutate", () => {
     });
 
     expect(result).toBe(true);
-    // Local store written immediately
-    expect(await client.store.getById("n1")).toMatchObject({ title: "offline-note" });
-    // But nothing pushed yet
+    // Nothing pushed yet — will push on drain when back online
     expect(transport.push).not.toHaveBeenCalled();
 
     // Restore
+    Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+  });
+
+  it("drains queued mutations when back online", async () => {
+    Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
+
+    let mutate!: (r: Note) => Promise<boolean>;
+
+    function Inner() {
+      mutate = useMutate<Note>();
+      return null;
+    }
+
+    await client.subscribe({ filter: {} });
+    render(<Wrapper client={client}><Inner /></Wrapper>);
+
+    await act(async () => {
+      await mutate(note({ title: "offline-note" }));
+    });
+
+    expect(transport.push).not.toHaveBeenCalled();
+
+    // Simulate going back online
+    Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+      await flushPromises();
+    });
+
+    expect(transport.push).toHaveBeenCalledWith([
+      expect.objectContaining({ recordId: "n1", title: "offline-note" }),
+    ]);
+
     Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
   });
 });

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useMemo } from "react";
 import type { SyncRecord, SubscriptionFilter } from "@sync-subscribe/core";
-import { matchesFilter } from "@sync-subscribe/core";
 import { useSyncClient } from "./context.js";
+import { useQuery } from "./useQuery.js";
 
 export interface UseRecordsOptions<T extends SyncRecord = SyncRecord> {
   filter: SubscriptionFilter<T>;
@@ -14,103 +14,37 @@ export interface UseRecordsOptions<T extends SyncRecord = SyncRecord> {
 }
 
 /**
- * Subscribe to a filtered view of synced records.
+ * Sync-and-query shorthand. Registers a live sync subscription for `filter`
+ * and returns its records as `{ data, loading }`.
  *
- * On mount the hook registers a subscription locally, performs an initial
- * pull, and returns the matching records from the local store. It re-renders
- * whenever the local store changes (patches applied or mutations written) and
- * polls the server on the given interval.
+ * `loading` is `true` until the first pull completes.
+ * The sync subscription is automatically removed when the component unmounts.
  *
- * When `filter` changes the old subscription is replaced with a new one
- * locally; gap/eviction analysis runs automatically.
- *
- * Records are filtered client-side using `matchesFilter` from @sync-subscribe/core,
- * which correctly handles overlapping subscriptions stored in the same LocalStore.
+ * For a narrower in-memory view over a broader background sync (e.g. showing
+ * 1 day of data while syncing 30 days), use `useQuery` with `client.query()`
+ * instead — it reads from the local store without registering a new subscription.
  *
  * @example
- * const notes = useRecords<NoteRecord>({ filter: { isDeleted: false } });
+ * const { data: notes, loading } = useRecords<NoteRecord>({
+ *   filter: { isDeleted: false },
+ *   name: "active-notes",
+ * });
  */
 export function useRecords<T extends SyncRecord>(
   options: UseRecordsOptions<T>,
-): T[] {
-  const { filter, name } = options;
+): { data: T[]; loading: boolean } {
   const client = useSyncClient<T>();
+  // Stringify the filter so object literals don't cause a new liveQuery on every render.
+  const filterKey = JSON.stringify(options.filter);
 
-  const [records, setRecords] = useState<T[]>([]);
-  const subIdRef = useRef<string | undefined>(undefined);
-
-  // Stable serialisation of filter — avoids re-subscribing on every render
-  // when the caller passes an inline object literal.
-  const filterKey = JSON.stringify(filter);
-
-  // Always hold the latest filter in a ref so async callbacks stay current.
-  const filterRef = useRef(filter);
-  filterRef.current = filter;
-
-  const refresh = useCallback(async () => {
-    const all = await client.store.getAll();
-    const f = filterRef.current;
-    setRecords(
-      all.filter((r) => matchesFilter(r, f)),
-    );
-  }, [client]);
-
-  // Create / update the server subscription, do an initial pull, then stream.
-  useEffect(() => {
-    let cancelled = false;
-    let stopStream: (() => void) | undefined;
-
-    async function startStream() {
-      await client.pull();
-      if (!cancelled) {
-        await refresh();
-        stopStream = client.stream();
-      }
-    }
-
-    async function init() {
-      const sub = await client.subscribe({
-        filter: filterRef.current,
-        ...(name !== undefined && { name }),
-        ...(subIdRef.current !== undefined && {
-          previousSubscriptionId: subIdRef.current,
-        }),
-      });
-      subIdRef.current = sub.subscriptionId;
-
-      await client.schedulePull();
-      if (cancelled) return;
-      await refresh();
-
-      if ((sub.status ?? "active") === "active") {
-        stopStream = client.stream();
-      } else {
-        // Subscription is pending gap fill — start stream once it becomes active.
-        const unsub = client.onSubscriptionActive(sub.subscriptionId, () => {
-          unsub();
-          if (!cancelled) {
-            startStream().catch(console.error);
-          }
-        });
-      }
-    }
-
-    init().catch(console.error);
-
-    return () => {
-      cancelled = true;
-      stopStream?.();
-    };
-    // filterKey stands in for filter — deep-equal stable dep.
+  const liveQuery = useMemo(
+    () => client.liveQuery({
+      filter: options.filter,
+      ...(options.name !== undefined && { name: options.name }),
+    }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterKey, client, refresh]);
+    [client, filterKey, options.name],
+  );
 
-  // Re-render whenever any patch lands (pull or conflict resolution).
-  useEffect(() => {
-    return client.onPatches(() => {
-      refresh().catch(console.error);
-    });
-  }, [client, refresh]);
-
-  return records;
+  return useQuery(liveQuery);
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { EMPTY_SYNC_TOKEN, encodeSyncToken } from "@sync-subscribe/core";
 import type { SyncRecord, SyncToken, SubscriptionFilter } from "@sync-subscribe/core";
 import { SyncClient } from "../syncClient.js";
@@ -78,10 +78,27 @@ describe("SyncClient", () => {
 
   it("mutate writes locally and pushes to server", async () => {
     await client.subscribe({ filter: {} });
+    const before = Date.now();
     const result = await client.mutate(rec());
+    const after = Date.now();
     expect(result).toBe(true);
-    expect(transport.push).toHaveBeenCalledWith([rec()]);
+    // mutate() stamps updatedAt and increments revisionCount — verify the pushed record
+    const pushed = vi.mocked(transport.push).mock.calls[0]![0]![0]!;
+    expect(pushed.recordId).toBe("r1");
+    expect(pushed.revisionCount).toBe(1); // no existing store record → (0)+1 = 1
+    expect(pushed.updatedAt).toBeGreaterThanOrEqual(before);
+    expect(pushed.updatedAt).toBeLessThanOrEqual(after);
     expect(await client.store.getById("r1")).toMatchObject({ name: "hello" });
+  });
+
+  it("mutate increments revisionCount from existing store record", async () => {
+    await client.subscribe({ filter: {} });
+    // First mutate — no existing record, revisionCount becomes 1
+    await client.mutate(rec({ revisionCount: 0 }));
+    // Second mutate — existing has revisionCount 1, so stamped value is 2
+    await client.mutate(rec());
+    const pushed = vi.mocked(transport.push).mock.calls[1]![0]![0]!;
+    expect(pushed.revisionCount).toBe(2);
   });
 
   it("mutate returns false and applies server record on conflict", async () => {
@@ -151,13 +168,184 @@ describe("updateSubscription / eviction", () => {
   });
 });
 
-describe("stream", () => {
-  it("throws when transport does not implement stream", async () => {
-    await client.subscribe({ filter: {} });
-    expect(() => client.stream()).toThrow("Transport does not support streaming");
+// Drains the microtask queue fully (handles multi-step async chains).
+const flushPromises = () => new Promise<void>((r) => setTimeout(r, 0));
+
+describe("query", () => {
+  it("emits loading:true then the current store contents", async () => {
+    await client.store.write(rec());
+
+    const states: { data: TestRecord[]; loading: boolean }[] = [];
+    const unsub = client.query({ filter: {} }).subscribe((s) => states.push(s));
+
+    // loading:true emitted synchronously
+    expect(states[0]).toEqual({ data: [], loading: true });
+
+    await flushPromises();
+    expect(states.at(-1)).toMatchObject({ loading: false });
+    expect(states.at(-1)!.data).toHaveLength(1);
+
+    unsub();
   });
 
-  it("applies patches from SSE stream and emits listeners", async () => {
+  it("re-emits when the store changes via pull", async () => {
+    // pull() requires at least one subscription to send a request
+    const sub = await client.subscribe({ filter: {} });
+
+    const states: { data: TestRecord[]; loading: boolean }[] = [];
+    const unsub = client.query({ filter: {} }).subscribe((s) => states.push(s));
+    await flushPromises(); // initial read
+
+    vi.mocked(transport.pull).mockResolvedValueOnce({
+      patches: [{ op: "upsert", record: rec() }],
+      syncTokens: { [sub.subscriptionId]: EMPTY_SYNC_TOKEN },
+    });
+    await client.pull();
+    await flushPromises(); // onPatches callback is async
+
+    const last = states.at(-1)!;
+    expect(last.loading).toBe(false);
+    expect(last.data).toHaveLength(1);
+
+    unsub();
+  });
+
+  it("applies the filter — only returns matching records", async () => {
+    await client.store.write(rec({ recordId: "r1", name: "hello" }));
+    await client.store.write(rec({ recordId: "r2", name: "world" }));
+
+    const states: { data: TestRecord[]; loading: boolean }[] = [];
+    const unsub = client.query({ filter: { name: "hello" } }).subscribe((s) => states.push(s));
+    await flushPromises();
+
+    const data = states.at(-1)!.data;
+    expect(data).toHaveLength(1);
+    expect(data[0]!.recordId).toBe("r1");
+    unsub();
+  });
+
+  it("stops emitting after unsubscribe", async () => {
+    await client.subscribe({ filter: {} });
+    const states: { data: TestRecord[]; loading: boolean }[] = [];
+    const unsub = client.query({ filter: {} }).subscribe((s) => states.push(s));
+    await flushPromises();
+    const countBefore = states.length;
+
+    unsub();
+
+    vi.mocked(transport.pull).mockResolvedValueOnce({
+      patches: [{ op: "upsert", record: rec() }],
+      syncTokens: {},
+    });
+    await client.pull();
+    await flushPromises();
+
+    expect(states.length).toBe(countBefore); // no new emissions after unsub
+  });
+
+  it("does not register a sync subscription", async () => {
+    const unsub = client.query({ filter: {} }).subscribe(() => {});
+    await flushPromises();
+    expect(client.getSubscription("anything")).toBeUndefined();
+    unsub();
+  });
+});
+
+describe("liveQuery", () => {
+  it("registers a sync subscription on first subscriber", async () => {
+    const lq = client.liveQuery({ filter: { name: "hello" } });
+    const unsub = lq.subscribe(() => {});
+    await flushPromises(); // _subscribe() has multiple async store calls
+
+    const subs = await client.store.listSubscriptions();
+    expect(subs).toHaveLength(1);
+    expect(subs[0]!.filter).toMatchObject({ name: "hello" });
+
+    unsub();
+    await flushPromises();
+  });
+
+  it("removes the sync subscription when last subscriber detaches", async () => {
+    const lq = client.liveQuery({ filter: {} });
+    const unsub1 = lq.subscribe(() => {});
+    const unsub2 = lq.subscribe(() => {});
+    await flushPromises();
+
+    unsub1();
+    expect((await client.store.listSubscriptions())).toHaveLength(1); // still active
+
+    unsub2();
+    await flushPromises(); // unsubscribe() is async
+    expect((await client.store.listSubscriptions())).toHaveLength(0);
+  });
+
+  it("re-emits when store changes via incoming patches", async () => {
+    const lq = client.liveQuery({ filter: {} });
+    const states: { data: TestRecord[]; loading: boolean }[] = [];
+    const unsub = lq.subscribe((s) => states.push(s));
+    await flushPromises(); // wait for subscribe + initial read
+
+    // Simulate an incoming pull patch
+    const subId = (await client.store.listSubscriptions())[0]!.subscriptionId;
+    vi.mocked(transport.pull).mockResolvedValueOnce({
+      patches: [{ op: "upsert", record: rec() }],
+      syncTokens: { [subId]: EMPTY_SYNC_TOKEN },
+    });
+    await client.pull();
+    await flushPromises();
+
+    expect(states.at(-1)!.data).toHaveLength(1);
+    unsub();
+    await flushPromises();
+  });
+
+  it("stores subscription under the given name", async () => {
+    const lq = client.liveQuery({ filter: { name: "hello" }, name: "my-notes" });
+    const unsub = lq.subscribe(() => {});
+    await flushPromises();
+
+    const stored = await client.store.getSubscription("my-notes");
+    expect(stored).toBeDefined();
+    expect(stored!.name).toBe("my-notes");
+
+    unsub();
+    await flushPromises();
+  });
+
+  it("emits current data to additional subscribers without re-subscribing", async () => {
+    await client.store.write(rec());
+    const lq = client.liveQuery({ filter: {} });
+
+    const states1: { data: TestRecord[]; loading: boolean }[] = [];
+    const states2: { data: TestRecord[]; loading: boolean }[] = [];
+
+    const unsub1 = lq.subscribe((s) => states1.push(s));
+    await flushPromises();
+    const unsub2 = lq.subscribe((s) => states2.push(s));
+    await flushPromises();
+
+    // Both subscribers get data; only one sync subscription registered
+    expect(states1.at(-1)!.data).toHaveLength(1);
+    expect(states2.at(-1)!.data).toHaveLength(1);
+    expect((await client.store.listSubscriptions())).toHaveLength(1);
+
+    unsub1();
+    unsub2();
+    await flushPromises();
+  });
+});
+
+describe("stream", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("does not throw when transport does not implement stream", async () => {
+    // transport has no .stream — subscribe should just skip streaming silently
+    await expect(client.subscribe({ filter: {} })).resolves.toBeDefined();
+    vi.runAllTimers();
+  });
+
+  it("starts stream automatically on subscribe and applies SSE patches", async () => {
     let capturedOnMessage: ((payload: { patches: unknown[]; syncTokens: Record<string, SyncToken> }) => void) | undefined;
     const streamTransport: SyncTransport = {
       ...makeTransport(),
@@ -169,13 +357,13 @@ describe("stream", () => {
 
     const streamClient = new SyncClient<TestRecord>(streamTransport);
     const sub = await streamClient.subscribe({ filter: {} });
+    // Stream is debounced — flush the timer
+    vi.runAllTimers();
 
     const receivedPatches: unknown[] = [];
     streamClient.onPatches((p) => receivedPatches.push(...p));
 
-    streamClient.stream();
-
-    // Verify stream was called with key+filter+syncToken shape
+    // Verify stream was opened with the subscription
     const streamArg = vi.mocked(streamTransport.stream!).mock.calls[0]![0];
     expect(streamArg[0]).toMatchObject({ key: sub.subscriptionId, filter: {} });
 
@@ -187,5 +375,43 @@ describe("stream", () => {
 
     expect(receivedPatches).toHaveLength(1);
     expect(await streamClient.store.getById("r1")).toMatchObject({ name: "hello" });
+  });
+
+  it("batches rapid subscribes into a single stream open", async () => {
+    const streamTransport: SyncTransport = {
+      ...makeTransport(),
+      stream: vi.fn(() => () => {}),
+    };
+
+    const streamClient = new SyncClient<TestRecord>(streamTransport);
+    await streamClient.subscribe({ filter: { name: "a" } });
+    await streamClient.subscribe({ filter: { name: "b" } });
+    // Both subscribes happened before the debounce timer fired
+    expect(vi.mocked(streamTransport.stream!)).not.toHaveBeenCalled();
+
+    vi.runAllTimers();
+    // Single stream open with both subscriptions
+    expect(vi.mocked(streamTransport.stream!)).toHaveBeenCalledOnce();
+    const callSubs = vi.mocked(streamTransport.stream!).mock.calls[0]![0];
+    expect(callSubs).toHaveLength(2);
+  });
+
+  it("stops stream when all subscriptions are removed", async () => {
+    const stopFn = vi.fn();
+    const streamTransport: SyncTransport = {
+      ...makeTransport(),
+      stream: vi.fn(() => stopFn),
+    };
+
+    const streamClient = new SyncClient<TestRecord>(streamTransport);
+    const sub = await streamClient.subscribe({ filter: {} });
+    vi.runAllTimers(); // open stream
+    expect(vi.mocked(streamTransport.stream!)).toHaveBeenCalledOnce();
+
+    await streamClient.unsubscribe(sub.subscriptionId);
+    vi.runAllTimers(); // debounced — no active subs → stream stops
+    expect(stopFn).toHaveBeenCalledOnce();
+    // No new stream opened (no active subs remain)
+    expect(vi.mocked(streamTransport.stream!)).toHaveBeenCalledOnce();
   });
 });

@@ -5,3 +5,4 @@ coverage/
 *.tsbuildinfo
 notes.db*
 .claude/
+.svelte-kit/

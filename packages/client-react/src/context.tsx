@@ -73,8 +73,7 @@ export function SyncProvider({ client, children }: SyncProviderProps) {
         return client.mutate(record);
       }
 
-      // Offline path: write locally for immediate reads, queue the push.
-      await client.store.write(record);
+      // Offline path: queue the raw record. mutate() will stamp on drain.
       queue.current.set(record.recordId, record);
       return true; // optimistic — push will happen when back online
     },
