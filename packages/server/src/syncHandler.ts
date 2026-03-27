@@ -79,7 +79,7 @@ export class SyncHandler<T extends SyncRecord> {
     return { patches: [...patchMap.values()], syncTokens };
   }
 
-  async push(req: { records: T[] }): Promise<{ ok: true } | ConflictResult<T>> {
+  async push(req: { records: T[] }): Promise<{ ok: true; serverUpdatedAt: number } | ConflictResult<T>> {
     const { readonlyFields, onRecordsChanged } = this.options;
     const stored: T[] = [];
     const now = Date.now();
@@ -117,7 +117,7 @@ export class SyncHandler<T extends SyncRecord> {
       onRecordsChanged?.(stored);
     }
 
-    return { ok: true };
+    return { ok: true, serverUpdatedAt: now };
   }
 
   /**
@@ -142,7 +142,6 @@ export class SyncHandler<T extends SyncRecord> {
       ...incoming,
       updatedAt: now,
       createdAt: existing ? existing.createdAt : now,
-      revisionCount: (existing?.revisionCount ?? 0) + 1,
     };
 
     const stored = await this.store.upsert(toStore);

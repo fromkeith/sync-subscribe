@@ -106,7 +106,9 @@ describe("SyncHandler", () => {
       const result = await handler.push({ records: [makeRecord()] });
       const after = Date.now();
 
-      expect(result).toEqual({ ok: true });
+      expect(result).toMatchObject({ ok: true });
+      expect((result as { serverUpdatedAt: number }).serverUpdatedAt).toBeGreaterThanOrEqual(before);
+      expect((result as { serverUpdatedAt: number }).serverUpdatedAt).toBeLessThanOrEqual(after);
       const stored = store.records.get("r1");
       expect(stored).toMatchObject({ recordId: "r1", name: "hello", revisionCount: 1 });
       expect(stored?.updatedAt).toBeGreaterThanOrEqual(before);
@@ -170,21 +172,21 @@ describe("SyncHandler", () => {
   });
 
   describe("serverUpsert", () => {
-    it("stores a new record with server-stamped timestamps and revisionCount 1", async () => {
+    it("stores a new record with server-stamped timestamps, preserving caller revisionCount", async () => {
       const before = Date.now();
-      const stored = await handler.serverUpsert(makeRecord({ revisionCount: 0 }));
+      const stored = await handler.serverUpsert(makeRecord({ revisionCount: 1 }));
       const after = Date.now();
 
-      expect(stored.revisionCount).toBe(1);
+      expect(stored.revisionCount).toBe(1); // caller owns revisionCount
       expect(stored.updatedAt).toBeGreaterThanOrEqual(before);
       expect(stored.updatedAt).toBeLessThanOrEqual(after);
       expect(stored.createdAt).toBeGreaterThanOrEqual(before);
     });
 
-    it("increments revisionCount on existing records", async () => {
+    it("preserves caller-provided revisionCount on existing records", async () => {
       store.records.set("r1", makeRecord({ revisionCount: 3 }));
-      const stored = await handler.serverUpsert(makeRecord({ name: "updated" }));
-      expect(stored.revisionCount).toBe(4);
+      const stored = await handler.serverUpsert(makeRecord({ name: "updated", revisionCount: 4 }));
+      expect(stored.revisionCount).toBe(4); // caller increments; server stores as-is
     });
 
     it("preserves createdAt for existing records", async () => {

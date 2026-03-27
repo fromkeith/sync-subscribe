@@ -1,0 +1,10 @@
+{
+  "name": "@sync-subscribe/core-go",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "build": "go build ./...",
+    "test": "go test ./...",
+    "clean": "go clean -testcache"
+  }
+}
