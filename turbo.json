@@ -1,5 +1,6 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": ["LOCALAPPDATA", "APPDATA", "GOPATH", "GOROOT", "GOCACHE", "HOME", "USERPROFILE"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
