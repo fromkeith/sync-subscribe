@@ -3,8 +3,8 @@ package syncserver_test
 import (
 	"testing"
 
-	synccore "github.com/sync-subscribe/core-go"
-	syncserver "github.com/sync-subscribe/server-go"
+	synccore "github.com/fromkeith/sync-subscribe/packages/core-go"
+	syncserver "github.com/fromkeith/sync-subscribe/packages/server-go"
 )
 
 // ---------------------------------------------------------------------------

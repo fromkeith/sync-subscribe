@@ -1,3 +1,3 @@
-module github.com/sync-subscribe/core-go
+module github.com/fromkeith/sync-subscribe/packages/core-go
 
 go 1.22

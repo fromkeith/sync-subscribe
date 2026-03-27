@@ -3,7 +3,7 @@ package syncserver
 import (
 	"time"
 
-	synccore "github.com/sync-subscribe/core-go"
+	synccore "github.com/fromkeith/sync-subscribe/packages/core-go"
 )
 
 // SyncHandler implements the core pull/push logic, decoupled from any HTTP

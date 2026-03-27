@@ -3,7 +3,7 @@ package synccore_test
 import (
 	"testing"
 
-	synccore "github.com/sync-subscribe/core-go"
+	synccore "github.com/fromkeith/sync-subscribe/packages/core-go"
 )
 
 // ---------------------------------------------------------------------------

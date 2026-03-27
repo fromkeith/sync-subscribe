@@ -3,7 +3,7 @@
 // HTTP handlers (net/http, chi, gin, echo, …).
 package syncserver
 
-import synccore "github.com/sync-subscribe/core-go"
+import synccore "github.com/fromkeith/sync-subscribe/packages/core-go"
 
 // SyncHandlerOptions configures a SyncHandler.
 type SyncHandlerOptions struct {

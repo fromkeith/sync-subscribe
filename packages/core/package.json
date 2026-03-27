@@ -1,8 +1,14 @@
 {
   "name": "@sync-subscribe/core",
   "version": "0.0.1",
-  "private": true,
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
