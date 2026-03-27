@@ -1,0 +1,137 @@
+name: Publish
+
+# Triggered by pushing a version tag, e.g. git tag v1.0.0 && git push origin v1.0.0
+# Before tagging:
+#   1. Bump versions in all package.json files
+#   2. Run pnpm install to update pnpm-lock.yaml
+#   3. Commit and push to main
+#   4. git tag v<VERSION> && git push origin v<VERSION>
+#
+# Required repository secrets:
+#   NPM_TOKEN  — npm access token with publish rights to the @sync-subscribe scope
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Publish JS/TS packages to npm
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for npm provenance attestation (npm 9.5+)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build
+
+      - run: pnpm run test
+
+      # pnpm automatically replaces workspace:* with the real version on publish.
+      # --access public is required for scoped packages (@sync-subscribe/*).
+      # --no-git-checks skips the "is working tree clean" check (not needed in CI).
+      - name: Publish all packages to npm
+        run: pnpm -r publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # 2. Tag Go modules for go get / GOPROXY consumption
+  #
+  # Go modules in a monorepo are published as sub-directory module tags.
+  # consumers use:
+  #   go get github.com/fromkeith/sync-subscribe/packages/core-go@v1.0.0
+  #   go get github.com/fromkeith/sync-subscribe/packages/server-go@v1.0.0
+  #
+  # The workflow:
+  #   a. Tags core-go at packages/core-go/v<VERSION>
+  #   b. Updates server-go go.mod to depend on the just-released core-go version
+  #   c. Commits the go.mod update to main
+  #   d. Tags server-go at packages/server-go/v<VERSION>
+  # ---------------------------------------------------------------------------
+  publish-go:
+    name: Tag Go modules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to push the go.mod update commit and module tags
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main        # check out the branch so we can push a commit back
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: Extract semver from tag
+        id: ver
+        # GITHUB_REF is refs/tags/v1.2.3 → strip the leading refs/tags/v
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # ---- core-go -----------------------------------------------------------
+
+      - name: Test core-go
+        working-directory: packages/core-go
+        run: go test ./...
+
+      - name: Tag core-go module
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "packages/core-go/v${{ steps.ver.outputs.version }}"
+          git push origin "packages/core-go/v${{ steps.ver.outputs.version }}"
+
+      # ---- server-go ---------------------------------------------------------
+      # Update server-go/go.mod to reference the freshly tagged core-go version.
+      # GOPROXY=direct bypasses the module proxy so the new tag is visible
+      # immediately without waiting for proxy cache propagation.
+
+      - name: Update server-go go.mod to released core-go version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cd packages/server-go
+          go mod edit \
+            -dropreplace=github.com/fromkeith/sync-subscribe/packages/core-go \
+            -require=github.com/fromkeith/sync-subscribe/packages/core-go@v${VERSION}
+          GOPROXY=direct GONOSUMDB='*' go mod tidy
+
+      - name: Test server-go against released core-go
+        working-directory: packages/server-go
+        env:
+          GOPROXY: direct
+          GONOSUMDB: '*'
+        run: go test ./...
+
+      - name: Commit go.mod update and tag server-go module
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/server-go/go.mod packages/server-go/go.sum
+          # Commit only if go.mod actually changed
+          git diff --cached --quiet || \
+            git commit -m "chore: update server-go require to core-go v${VERSION} [skip ci]"
+          git push origin HEAD:main
+          git tag "packages/server-go/v${VERSION}"
+          git push origin "packages/server-go/v${VERSION}"
