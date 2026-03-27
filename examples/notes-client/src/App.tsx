@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useRecords, useMutate } from "@sync-subscribe/client-react";
+import { useEffect, useMemo, useState } from "react";
+import { useRecords, useMutate, useSyncClient, useQuery } from "@sync-subscribe/client-react";
 import type { NoteRecord } from "./types.js";
 import NotesList from "./components/NotesList.js";
 import CreateNoteForm from "./components/CreateNoteForm.js";
@@ -8,6 +8,7 @@ type Tab = "all" | "recent" | "blue";
 type RecentRange = "1d" | "2d" | "1w" | "1m" | "2m" | "all";
 
 const DAY = 24 * 60 * 60 * 1000;
+const SEVEN_DAYS = 7 * DAY;
 
 const RANGE_MS: Record<RecentRange, number | null> = {
   "1d": 1 * DAY,
@@ -37,7 +38,27 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("recent");
   const [recentRange, setRecentRange] = useState<RecentRange>("1m");
   const [showCreate, setShowCreate] = useState(false);
+  const client = useSyncClient<NoteRecord>();
   const mutate = useMutate<NoteRecord>();
+
+  // Sync-only: keep the last 7 days in the local store without loading into memory.
+  // liveQuery / query below handle the reactive display based on the selected range.
+  useEffect(() => {
+    const filter = { createdAt: { $gte: Date.now() - SEVEN_DAYS } };
+    let cancelled = false;
+    let subId: string | undefined;
+    client.subscribe({ filter, name: "recent-7d-sync" }).then((sub) => {
+      if (cancelled) {
+        void client.unsubscribe(sub.subscriptionId);
+      } else {
+        subId = sub.subscriptionId;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (subId !== undefined) void client.unsubscribe(subId);
+    };
+  }, [client]);
 
   // Recompute cutoff only when range changes, not on every render.
   const cutoff = useMemo(() => {
@@ -50,14 +71,29 @@ export default function App() {
     [cutoff],
   );
 
-  const recentNotes = useRecords<NoteRecord>({
-    filter: recentFilter,
-    name: "recent-notes",
-  });
-  const blueNotes = useRecords<NoteRecord>({
+  // Within 7 days: the sync-only subscription keeps this data fresh, so a plain
+  // query (local store only) is enough — no new sync subscription needed.
+  // Beyond 7 days: liveQuery registers its own sync subscription to pull older data on demand.
+  const withinSyncWindow = RANGE_MS[recentRange] !== null && RANGE_MS[recentRange]! <= SEVEN_DAYS;
+  const recentFilterKey = JSON.stringify(recentFilter);
+
+  const recentQuery = useMemo(
+    () =>
+      withinSyncWindow
+        ? client.query({ filter: recentFilter })
+        : client.liveQuery({ filter: recentFilter }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [client, recentFilterKey, withinSyncWindow],
+  );
+
+  const { data: recentNotes, loading: recentLoading } = useQuery<NoteRecord>(recentQuery);
+
+  const { data: blueNotes, loading: blueLoading } = useRecords<NoteRecord>({
     filter: { color: "blue" },
     name: "blue-notes",
   });
+
+  const loading = recentLoading || blueLoading;
 
   const allNotes = useMemo(() => {
     const map = new Map<string, NoteRecord>();
@@ -74,29 +110,19 @@ export default function App() {
   }, [tab, allNotes, recentNotes, blueNotes]);
 
   async function handleCreate(
-    data: Omit<
-      NoteRecord,
-      "recordId" | "createdAt" | "updatedAt" | "revisionCount" | "userId"
-    >,
+    data: Omit<NoteRecord, "recordId" | "createdAt" | "updatedAt" | "revisionCount" | "userId">,
   ) {
     await mutate({
       recordId: crypto.randomUUID(),
       userId: "user-123",
       createdAt: Date.now(),
-      updatedAt: Date.now(),
-      revisionCount: 1,
       ...data,
     } as NoteRecord);
     setShowCreate(false);
   }
 
   async function handleDelete(note: NoteRecord) {
-    await mutate({
-      ...note,
-      isDeleted: true,
-      updatedAt: Date.now(),
-      revisionCount: note.revisionCount + 1,
-    });
+    await mutate({ ...note, isDeleted: true });
   }
 
   const countFor = (t: Tab) => {
@@ -195,13 +221,29 @@ export default function App() {
               }}
             >
               {RANGE_LABELS[r]}
+              {(RANGE_MS[r] === null || RANGE_MS[r]! > SEVEN_DAYS) && (
+                <span
+                  style={{
+                    marginLeft: 5,
+                    fontSize: 10,
+                    opacity: 0.6,
+                    fontWeight: 400,
+                  }}
+                >
+                  live
+                </span>
+              )}
             </button>
           ))}
         </div>
       )}
 
       {/* Notes grid */}
-      <NotesList notes={visibleNotes} onDelete={handleDelete} />
+      {loading ? (
+        <p style={{ color: "#94a3b8", fontSize: 14 }}>Loading…</p>
+      ) : (
+        <NotesList notes={visibleNotes} onDelete={handleDelete} />
+      )}
 
       {/* Create modal */}
       {showCreate && (
