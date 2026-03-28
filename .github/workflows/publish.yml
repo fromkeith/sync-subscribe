@@ -4,7 +4,7 @@ name: Publish
 # Before tagging:
 #   1. Bump versions in all package.json files
 #   2. Run pnpm install to update pnpm-lock.yaml
-#   3. Commit and push to main
+#   3. Commit and push to master
 #   4. git tag v<VERSION> && git push origin v<VERSION>
 #
 # Required repository secrets:
@@ -63,7 +63,7 @@ jobs:
   # The workflow:
   #   a. Tags core-go at packages/core-go/v<VERSION>
   #   b. Updates server-go go.mod to depend on the just-released core-go version
-  #   c. Commits the go.mod update to main
+  #   c. Commits the go.mod update to master
   #   d. Tags server-go at packages/server-go/v<VERSION>
   # ---------------------------------------------------------------------------
   publish-go:
@@ -74,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main # check out the branch so we can push a commit back
+          ref: master # check out the branch so we can push a commit back
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -132,6 +132,6 @@ jobs:
           # Commit only if go.mod actually changed
           git diff --cached --quiet || \
             git commit -m "chore: update server-go require to core-go v${VERSION} [skip ci]"
-          git push origin HEAD:main
+          git push origin HEAD:master
           git tag "packages/server-go/v${VERSION}"
           git push origin "packages/server-go/v${VERSION}"
