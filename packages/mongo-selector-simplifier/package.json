@@ -5,9 +5,11 @@
   "publishConfig": {
     "access": "public"
   },
+  "license": "MIT",
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

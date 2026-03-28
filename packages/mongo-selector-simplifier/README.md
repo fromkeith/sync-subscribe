@@ -21,3 +21,7 @@ const simplified = simplifySelector({
 ```
 
 This package is a low-level utility. For application code, use the filter types from `@sync-subscribe/core` and the matching function `matchesFilter`.
+
+## Attribution
+
+This package is a TypeScript port of [@candis/mongo-selector-simplifier](https://github.com/CandisIO/mongo-selector-simplifier) by [Candis](https://candis.io), used under the MIT License. See [LICENSE](./LICENSE) for details.
